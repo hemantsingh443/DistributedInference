@@ -166,7 +166,7 @@ class ActivationRouter:
             f"Loading shard on {address}: layers [{start_layer}, {end_layer})"
         )
 
-        response = stub.LoadModelShard(assignment, timeout=300)
+        response = stub.LoadModelShard(assignment, timeout=600)
         return response
 
     def check_node_health(self, address: str) -> Optional[inference_pb2.NodeStatus]:

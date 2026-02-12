@@ -67,7 +67,7 @@ def detect_resources(
 
     if use_cuda:
         props = torch.cuda.get_device_properties(0)
-        vram_total_mb = props.total_mem // (1024 * 1024)
+        vram_total_mb = props.total_memory // (1024 * 1024)
         device_name = props.name
 
         # Estimate TFLOPS from SM count and clock speed

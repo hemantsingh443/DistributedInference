@@ -11,7 +11,6 @@ Usage:
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -68,23 +67,23 @@ def main():
     coordinator_addr = f"localhost:{args.coordinator_port}"
     processes = []
 
-    try:
-        # ─── Start Coordinator ───
-        log.info("[bold blue]Starting coordinator...[/]")
-        coord_cmd = [
-            sys.executable, "-m", "distributed_inference.cli.start_coordinator",
-            "--port", str(args.coordinator_port),
-            "--log-level", "INFO",
-        ]
-        coord_proc = subprocess.Popen(
-            coord_cmd,
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")},
-        )
-        processes.append(coord_proc)
-        time.sleep(2)  # Give coordinator time to start
+    orchestrator = None
 
-        # ─── Start Nodes ───
+    try:
+        # ─── Start Coordinator In-Process ───
+        from distributed_inference.common.config import load_config
+        from distributed_inference.coordinator.orchestrator import Orchestrator
+        from distributed_inference.benchmarks.profiler import InferenceProfiler
+
+        log.info("[bold blue]Starting coordinator in-process...[/]")
+        config = load_config()
+        config.coordinator.port = args.coordinator_port
+
+        orchestrator = Orchestrator(config=config)
+        orchestrator.start(block=False)
+        time.sleep(1)  # Give gRPC server time to bind
+
+        # ─── Start Node Subprocesses ───
         node_base_port = args.coordinator_port + 1
         for i in range(args.num_nodes):
             port = node_base_port + i
@@ -113,43 +112,13 @@ def main():
             processes.append(node_proc)
             time.sleep(1)
 
-        # Wait for all nodes to register
+        # ─── Wait for Nodes to Register ───
         log.info(f"Waiting for {args.num_nodes} nodes to register...")
-        time.sleep(5)
+        orchestrator.wait_for_nodes(args.num_nodes, timeout=60)
 
-        # ─── Set up model and run inference via Python API ───
+        # ─── Set up model and run inference ───
         log.info("[bold magenta]Setting up model and running inference...[/]")
-
-        from distributed_inference.common.config import load_config
-        from distributed_inference.coordinator.orchestrator import Orchestrator
-        from distributed_inference.benchmarks.profiler import InferenceProfiler
-
-        import grpc
-        from distributed_inference.proto import inference_pb2
-        from distributed_inference.proto import inference_pb2_grpc
-
-        # Connect to coordinator and set up model
-        options = [
-            ("grpc.max_send_message_length", 256 * 1024 * 1024),
-            ("grpc.max_receive_message_length", 256 * 1024 * 1024),
-        ]
-        channel = grpc.insecure_channel(coordinator_addr, options=options)
-        stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
-
-        # First, we need the coordinator to set up the model
-        # We do this by creating a local orchestrator instance that connects
-        # to the same registry
-        # For the demo, we'll use the coordinator directly
-        config = load_config()
-        config.coordinator.port = args.coordinator_port
-
-        # Use the orchestrator directly for setup
-        orchestrator = Orchestrator(config=config)
-        orchestrator.start(block=False)
-
-        # Wait for nodes to register with this orchestrator
-        time.sleep(3)
-        orchestrator.wait_for_nodes(args.num_nodes, timeout=30)
+        profiler = InferenceProfiler()
 
         # Set up model
         log.info("[bold yellow]Partitioning model and loading shards...[/]")
