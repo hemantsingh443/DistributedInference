@@ -1,0 +1,35 @@
+# Distributed Inference System — Default Configuration
+
+model:
+  name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  dtype: "float16"
+  num_layers: 22
+  hidden_size: 2048
+  intermediate_size: 5632
+  num_attention_heads: 32
+  num_kv_heads: 4
+  max_sequence_length: 2048
+
+coordinator:
+  host: "localhost"
+  port: 50050
+  heartbeat_interval_sec: 5.0
+  heartbeat_timeout_sec: 15.0
+  failure_threshold: 3
+  max_concurrent_requests: 4
+
+node:
+  host: "localhost"
+  device: "auto"
+  coordinator_address: "localhost:50050"
+
+inference:
+  max_tokens: 50
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  do_sample: true
+
+communication:
+  compress_tensors: false
+  max_message_size_mb: 256

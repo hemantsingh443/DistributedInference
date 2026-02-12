@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package distributed_inference;
+
+// ============================================================
+// Message Types
+// ============================================================
+
+// Serialized tensor data
+message TensorData {
+  bytes data = 1;         // Serialized tensor bytes (torch.save format)
+  repeated int64 shape = 2;
+  string dtype = 3;       // e.g. "float16", "float32"
+}
+
+// Activation data passed between nodes during forward pass
+message ActivationData {
+  TensorData hidden_states = 1;
+  TensorData attention_mask = 2;
+  TensorData position_ids = 3;
+  string request_id = 4;
+  int32 current_layer = 5;  // Track which layer we're at
+}
+
+// Node capability information
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;       // host:port
+  int64 vram_mb = 3;
+  float compute_tflops = 4;
+  float bandwidth_mbps = 5;
+  string device_type = 6;   // "cuda" or "cpu"
+  string device_name = 7;
+}
+
+// Node health/status report
+message NodeStatus {
+  string node_id = 1;
+  enum Status {
+    IDLE = 0;
+    LOADING = 1;
+    READY = 2;
+    BUSY = 3;
+    ERROR = 4;
+  }
+  Status status = 2;
+  int64 vram_used_mb = 3;
+  int64 vram_total_mb = 4;
+  repeated int32 assigned_layers = 5;
+  float load_percent = 6;
+  int64 timestamp_ms = 7;
+}
+
+// Shard assignment from coordinator to node
+message ShardAssignment {
+  string model_name = 1;
+  int32 start_layer = 2;
+  int32 end_layer = 3;       // exclusive
+  bool has_embedding = 4;    // first node holds embedding layer
+  bool has_lm_head = 5;      // last node holds lm_head
+  string dtype = 6;          // "float16" or "float32"
+}
+
+// Registration acknowledgement
+message RegistrationAck {
+  bool success = 1;
+  string message = 2;
+  string assigned_node_id = 3;
+}
+
+// Inference request from client
+message InferenceRequest {
+  string request_id = 1;
+  string prompt = 2;
+  int32 max_tokens = 3;
+  float temperature = 4;
+  float top_p = 5;
+  int32 top_k = 6;
+}
+
+// Inference response to client
+message InferenceResponse {
+  string request_id = 1;
+  string generated_text = 2;
+  int32 tokens_generated = 3;
+  float total_latency_ms = 4;
+  repeated float per_hop_latency_ms = 5;
+  float tokens_per_second = 6;
+}
+
+// Simple ack/ping
+message Empty {}
+
+message HeartbeatResponse {
+  NodeStatus status = 1;
+}
+
+// ============================================================
+// Node Service — runs on each node
+// ============================================================
+service NodeService {
+  // Coordinator tells node to load specific model layers
+  rpc LoadModelShard(ShardAssignment) returns (NodeStatus);
+
+  // Forward pass: receive activations, process through local layers, return activations
+  rpc RunForward(ActivationData) returns (ActivationData);
+
+  // Health check
+  rpc Heartbeat(Empty) returns (HeartbeatResponse);
+
+  // Unload current shard (for re-partitioning)
+  rpc UnloadShard(Empty) returns (NodeStatus);
+}
+
+// ============================================================
+// Coordinator Service — runs on the coordinator
+// ============================================================
+service CoordinatorService {
+  // Node registers itself with the coordinator
+  rpc RegisterNode(NodeInfo) returns (RegistrationAck);
+
+  // Node sends periodic health reports
+  rpc ReportHealth(NodeStatus) returns (Empty);
+
+  // Client submits an inference request
+  rpc SubmitInference(InferenceRequest) returns (InferenceResponse);
+}
