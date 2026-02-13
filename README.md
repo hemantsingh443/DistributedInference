@@ -2,7 +2,7 @@
 
 A prototype distributed inference system where multiple nodes collaboratively run forward-pass inference on a sharded LLM (TinyLlama 1.1B). Designed to validate dynamic model partitioning, measure communication overhead, and test fault tolerance.
 
-> **Note:** the caching of models are off, `executor.py` is only optimized for TinyLlama 1.1B or any similar archiecture.
+> **Note:** the caching of models are off, `executor.py` is only optimized for TinyLlama 1.1B or any similar architecture.
 
 ## Architecture
 
