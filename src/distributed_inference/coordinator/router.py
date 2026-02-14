@@ -5,7 +5,8 @@ handling serialization/deserialization and measuring per-hop latency.
 """
 
 import time
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Tuple
 
 import grpc
 import torch
@@ -20,6 +21,15 @@ from distributed_inference.proto import inference_pb2
 from distributed_inference.proto import inference_pb2_grpc
 
 log = get_logger(__name__)
+
+
+@dataclass
+class HopTrace:
+    """Trace record for a single pipeline hop."""
+    hop_index: int
+    stage: PipelineStage
+    output: torch.Tensor
+    hop_latency_ms: float
 
 
 class ActivationRouter:
@@ -64,11 +74,32 @@ class ActivationRouter:
             Tuple of (output_logits, per_hop_latency_ms).
         """
         per_hop_latency = []
+        current_data: Optional[torch.Tensor] = None
+        for trace in self.route_forward_stream(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            execution_plan=execution_plan,
+            request_id=request_id,
+        ):
+            current_data = trace.output
+            per_hop_latency.append(trace.hop_latency_ms)
+
+        if current_data is None:
+            raise RuntimeError("Execution plan has no stages")
+        return current_data, per_hop_latency
+
+    def route_forward_stream(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        execution_plan: ExecutionPlan,
+        request_id: str = "",
+    ) -> Iterator[HopTrace]:
+        """Route a forward pass and emit hop traces as they complete."""
         current_data = input_ids  # Start with input_ids
 
         for i, stage in enumerate(execution_plan.stages):
             hop_start = time.time()
-            is_first = (i == 0)
 
             log.info(
                 f"[cyan]Hop {i}[/]: → {stage.node_id} @ {stage.address} "
@@ -77,10 +108,7 @@ class ActivationRouter:
 
             stub = self._get_stub(stage.address)
 
-            # Serialize current data
             hidden_data = serialize_tensor(current_data)
-
-            # Build activation message
             activation = inference_pb2.ActivationData(
                 hidden_states=inference_pb2.TensorData(
                     data=hidden_data,
@@ -91,7 +119,6 @@ class ActivationRouter:
                 current_layer=stage.start_layer,
             )
 
-            # Add attention mask (pass through on all hops)
             if attention_mask is not None:
                 mask_bytes = serialize_tensor(attention_mask)
                 activation.attention_mask.CopyFrom(
@@ -102,7 +129,6 @@ class ActivationRouter:
                     )
                 )
 
-            # Send to node and wait for response
             try:
                 response = stub.RunForward(activation, timeout=120)
             except grpc.RpcError as e:
@@ -114,18 +140,20 @@ class ActivationRouter:
                     f"Forward pass failed at node {stage.node_id}: {e.details()}"
                 ) from e
 
-            # Deserialize output
             current_data = deserialize_tensor(response.hidden_states.data)
-
             hop_ms = (time.time() - hop_start) * 1000
-            per_hop_latency.append(hop_ms)
 
             log.info(
                 f"  Hop {i} complete: output_shape={list(current_data.shape)}, "
                 f"time={hop_ms:.1f}ms"
             )
 
-        return current_data, per_hop_latency
+            yield HopTrace(
+                hop_index=i,
+                stage=stage,
+                output=current_data,
+                hop_latency_ms=hop_ms,
+            )
 
     def load_shard_on_node(
         self,

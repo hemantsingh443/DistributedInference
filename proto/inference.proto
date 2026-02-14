@@ -88,6 +88,38 @@ message InferenceResponse {
   float tokens_per_second = 6;
 }
 
+// Per-hop telemetry event emitted during streaming inference.
+message HopEvent {
+  int32 step = 1;
+  int32 hop_index = 2;
+  string node_id = 3;
+  string address = 4;
+  int32 start_layer = 5;
+  int32 end_layer = 6;
+  float hop_latency_ms = 7;
+}
+
+// Token telemetry event emitted during streaming inference.
+message TokenEvent {
+  int32 step = 1;
+  int32 token_id = 2;
+  string token_text = 3;
+  string accumulated_text = 4;
+}
+
+// Streaming inference event. Exactly one payload variant is set.
+message InferenceEvent {
+  string request_id = 1;
+  int64 timestamp_ms = 2;
+
+  oneof payload {
+    HopEvent hop = 3;
+    TokenEvent token = 4;
+    InferenceResponse completed = 5;
+    string error = 6;
+  }
+}
+
 // Simple ack/ping
 message Empty {}
 
@@ -124,4 +156,7 @@ service CoordinatorService {
 
   // Client submits an inference request
   rpc SubmitInference(InferenceRequest) returns (InferenceResponse);
+
+  // Client submits an inference request and receives streaming events.
+  rpc SubmitInferenceStream(InferenceRequest) returns (stream InferenceEvent);
 }

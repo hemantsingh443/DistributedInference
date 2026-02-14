@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from concurrent import futures
-from typing import Optional
+from typing import Iterator, Optional
 
 import grpc
 import torch
@@ -90,6 +90,34 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             return inference_pb2.InferenceResponse(
                 request_id=request.request_id,
                 generated_text=f"ERROR: {e}",
+            )
+
+    def SubmitInferenceStream(self, request, context):
+        """Handle a streaming inference request from a client."""
+        request_id = request.request_id or uuid.uuid4().hex[:8]
+        log.info(
+            f"[bold magenta]Streaming inference request[/]: "
+            f"request_id={request_id} "
+            f"prompt='{request.prompt[:50]}...' "
+            f"max_tokens={request.max_tokens}"
+        )
+
+        try:
+            for event in self.orchestrator.run_inference_stream(
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature or 0.7,
+                top_p=request.top_p or 0.9,
+                top_k=request.top_k or 50,
+                request_id=request_id,
+            ):
+                yield event
+        except Exception as e:
+            log.error(f"Streaming inference failed: {e}")
+            yield inference_pb2.InferenceEvent(
+                request_id=request_id,
+                timestamp_ms=int(time.time() * 1000),
+                error=str(e),
             )
 
 
@@ -264,27 +292,45 @@ class Orchestrator:
         top_k: int = 50,
         request_id: str = "",
     ) -> inference_pb2.InferenceResponse:
-        """Run inference on a prompt using the distributed pipeline.
+        """Run inference and return the final aggregated response."""
+        completed = None
+        stream_request_id = request_id or uuid.uuid4().hex[:8]
 
-        Implements autoregressive token generation across the pipeline.
+        for event in self.run_inference_stream(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            request_id=stream_request_id,
+        ):
+            if event.WhichOneof("payload") == "completed":
+                completed = event.completed
+            elif event.WhichOneof("payload") == "error":
+                raise RuntimeError(event.error)
 
-        Args:
-            prompt: Input text prompt.
-            max_tokens: Maximum tokens to generate.
-            temperature: Sampling temperature.
-            top_p: Nucleus sampling threshold.
-            top_k: Top-k sampling parameter.
-            request_id: Unique request identifier.
+        if completed is None:
+            raise RuntimeError("Inference stream ended without a completion event")
+        return completed
 
-        Returns:
-            InferenceResponse with generated text and metrics.
-        """
+    def run_inference_stream(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        request_id: str = "",
+    ) -> Iterator[inference_pb2.InferenceEvent]:
+        """Run inference and yield streaming hop/token/completion events."""
         if not self.is_ready:
             raise RuntimeError("Model not set up. Call setup_model() first.")
+        if not self._execution_plan:
+            raise RuntimeError("No execution plan available")
 
         start_time = time.time()
+        request_id = request_id or uuid.uuid4().hex[:8]
 
-        # Tokenize input
         inputs = self._tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
@@ -292,74 +338,75 @@ class Orchestrator:
         all_hop_latencies = []
         generated_tokens = 0
 
-        # Autoregressive generation loop
         for step in range(max_tokens):
-            # Forward pass through the distributed pipeline
-            logits, hop_latencies = self.router.route_forward(
+            logits = None
+
+            for trace in self.router.route_forward_stream(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 execution_plan=self._execution_plan,
                 request_id=f"{request_id}-step{step}",
+            ):
+                logits = trace.output
+                all_hop_latencies.append(trace.hop_latency_ms)
+                yield inference_pb2.InferenceEvent(
+                    request_id=request_id,
+                    timestamp_ms=int(time.time() * 1000),
+                    hop=inference_pb2.HopEvent(
+                        step=step,
+                        hop_index=trace.hop_index,
+                        node_id=trace.stage.node_id,
+                        address=trace.stage.address,
+                        start_layer=trace.stage.start_layer,
+                        end_layer=trace.stage.end_layer,
+                        hop_latency_ms=trace.hop_latency_ms,
+                    ),
+                )
+
+            if logits is None:
+                raise RuntimeError("No logits returned from pipeline routing")
+
+            next_token = self._sample_next_token(
+                logits=logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
             )
 
-            all_hop_latencies.extend(hop_latencies)
-
-            # Sample next token from logits
-            next_token_logits = logits[:, -1, :]  # Last position
-
-            if temperature > 0:
-                next_token_logits = next_token_logits / temperature
-
-                # Top-k filtering
-                if top_k > 0:
-                    indices_to_remove = (
-                        next_token_logits
-                        < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                    )
-                    next_token_logits[indices_to_remove] = float("-inf")
-
-                # Top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(
-                        next_token_logits, descending=True
-                    )
-                    cumulative_probs = torch.cumsum(
-                        torch.softmax(sorted_logits, dim=-1), dim=-1
-                    )
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                        ..., :-1
-                    ].clone()
-                    sorted_indices_to_remove[..., 0] = False
-                    indices_to_remove = sorted_indices_to_remove.scatter(
-                        1, sorted_indices, sorted_indices_to_remove
-                    )
-                    next_token_logits[indices_to_remove] = float("-inf")
-
-                probs = torch.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-            # Check for EOS
             if next_token.item() == self._tokenizer.eos_token_id:
                 break
 
-            # Append token to sequence
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             if attention_mask is not None:
                 attention_mask = torch.cat(
-                    [attention_mask, torch.ones(1, 1, dtype=torch.long)],
+                    [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
                     dim=-1,
                 )
 
             generated_tokens += 1
 
-        # Decode full generated text
+            token_id = int(next_token.item())
+            token_text = self._tokenizer.decode(
+                [token_id], skip_special_tokens=False
+            )
+            accumulated_text = self._tokenizer.decode(
+                input_ids[0], skip_special_tokens=True
+            )
+
+            yield inference_pb2.InferenceEvent(
+                request_id=request_id,
+                timestamp_ms=int(time.time() * 1000),
+                token=inference_pb2.TokenEvent(
+                    step=step,
+                    token_id=token_id,
+                    token_text=token_text,
+                    accumulated_text=accumulated_text,
+                ),
+            )
+
         generated_text = self._tokenizer.decode(
             input_ids[0], skip_special_tokens=True
         )
-
         total_time_ms = (time.time() - start_time) * 1000
         tokens_per_sec = (
             generated_tokens / (total_time_ms / 1000)
@@ -372,14 +419,61 @@ class Orchestrator:
             f"({tokens_per_sec:.1f} tok/s)"
         )
 
-        return inference_pb2.InferenceResponse(
+        yield inference_pb2.InferenceEvent(
             request_id=request_id,
-            generated_text=generated_text,
-            tokens_generated=generated_tokens,
-            total_latency_ms=total_time_ms,
-            per_hop_latency_ms=all_hop_latencies,
-            tokens_per_second=tokens_per_sec,
+            timestamp_ms=int(time.time() * 1000),
+            completed=inference_pb2.InferenceResponse(
+                request_id=request_id,
+                generated_text=generated_text,
+                tokens_generated=generated_tokens,
+                total_latency_ms=total_time_ms,
+                per_hop_latency_ms=all_hop_latencies,
+                tokens_per_second=tokens_per_sec,
+            ),
         )
+
+    @staticmethod
+    def _sample_next_token(
+        logits: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> torch.Tensor:
+        """Sample one token from model logits."""
+        next_token_logits = logits[:, -1, :]  # Last position.
+
+        if temperature > 0:
+            next_token_logits = next_token_logits / temperature
+
+            if top_k > 0:
+                k = min(top_k, next_token_logits.shape[-1])
+                indices_to_remove = (
+                    next_token_logits
+                    < torch.topk(next_token_logits, k)[0][..., -1, None]
+                )
+                next_token_logits[indices_to_remove] = float("-inf")
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(
+                    next_token_logits, descending=True
+                )
+                cumulative_probs = torch.cumsum(
+                    torch.softmax(sorted_logits, dim=-1), dim=-1
+                )
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                    ..., :-1
+                ].clone()
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                next_token_logits[indices_to_remove] = float("-inf")
+
+            probs = torch.softmax(next_token_logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+
+        return torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
     def _health_monitor_loop(self) -> None:
         """Background health monitoring of registered nodes."""

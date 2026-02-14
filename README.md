@@ -42,6 +42,14 @@ python scripts/run_demo.py --num-nodes 3 --prompt "The future of AI is" --max-to
 
 This spawns a coordinator + 3 simulated nodes (with different VRAM caps), partitions TinyLlama across them, runs inference, and prints metrics.
 
+### Run the Web Stack (All-in-One)
+
+```bash
+python scripts/run_web_demo.py --num-nodes 3 --web-port 8000 --open-browser
+```
+
+This starts coordinator + nodes + web gateway in one command and keeps them running for interactive prompts and live hop/token streaming.
+
 ### Manual Setup
 
 **Terminal 1 — Coordinator:**
@@ -74,6 +82,19 @@ python -m distributed_inference.cli.start_node --port 50053 --coordinator localh
 python -m distributed_inference.cli.run_inference --coordinator localhost:50050 --prompt "Once upon a time" --max-tokens 50
 ```
 
+### Web Inference Console (Live Hop + Token Stream)
+
+After coordinator and nodes are running:
+
+```bash
+python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coordinator localhost:50050
+```
+
+Open `http://127.0.0.1:8000` in your browser to:
+- submit prompts from a UI
+- watch generated text stream token-by-token
+- view a per-hop timeline (node, layer range, latency) for every decode step
+
 ### Run Tests
 
 ```bash
@@ -91,6 +112,7 @@ src/distributed_inference/
 ├── pipeline/       # High-level inference pipeline API
 ├── benchmarks/     # Performance profiler
 ├── cli/            # CLI entry points
+├── web/            # FastAPI + HTMX web UI and SSE gateway
 └── proto/          # Generated gRPC/Protobuf stubs
 ```
 
@@ -116,6 +138,7 @@ inference:
 ## Key Design Decisions
 
 - **gRPC + Protobuf** for inter-node communication (portable, inspectable)
+- **Streaming inference RPC** for live token/hop telemetry to web clients
 - **Layer-wise pipeline parallelism** (minimal cross-node dependencies)
 - **VRAM-proportional partitioning** (nodes get layers proportional to their VRAM)
 - **Simulated VRAM caps** via `--max-vram-mb` for local testing on a single GPU

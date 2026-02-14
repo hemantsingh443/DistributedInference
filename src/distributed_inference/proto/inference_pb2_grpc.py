@@ -3,7 +3,10 @@
 import grpc
 import warnings
 
-from distributed_inference.proto import inference_pb2 as inference__pb2
+try:
+    from . import inference_pb2 as inference__pb2
+except ImportError:  # pragma: no cover - fallback for direct execution
+    import inference_pb2 as inference__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
@@ -266,6 +269,11 @@ class CoordinatorServiceStub(object):
                 request_serializer=inference__pb2.InferenceRequest.SerializeToString,
                 response_deserializer=inference__pb2.InferenceResponse.FromString,
                 _registered_method=True)
+        self.SubmitInferenceStream = channel.unary_stream(
+                '/distributed_inference.CoordinatorService/SubmitInferenceStream',
+                request_serializer=inference__pb2.InferenceRequest.SerializeToString,
+                response_deserializer=inference__pb2.InferenceEvent.FromString,
+                _registered_method=True)
 
 
 class CoordinatorServiceServicer(object):
@@ -295,6 +303,13 @@ class CoordinatorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubmitInferenceStream(self, request, context):
+        """Client submits an inference request and receives streaming events.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -312,6 +327,11 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     servicer.SubmitInference,
                     request_deserializer=inference__pb2.InferenceRequest.FromString,
                     response_serializer=inference__pb2.InferenceResponse.SerializeToString,
+            ),
+            'SubmitInferenceStream': grpc.unary_stream_rpc_method_handler(
+                    servicer.SubmitInferenceStream,
+                    request_deserializer=inference__pb2.InferenceRequest.FromString,
+                    response_serializer=inference__pb2.InferenceEvent.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -398,6 +418,33 @@ class CoordinatorService(object):
             '/distributed_inference.CoordinatorService/SubmitInference',
             inference__pb2.InferenceRequest.SerializeToString,
             inference__pb2.InferenceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitInferenceStream(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/distributed_inference.CoordinatorService/SubmitInferenceStream',
+            inference__pb2.InferenceRequest.SerializeToString,
+            inference__pb2.InferenceEvent.FromString,
             options,
             channel_credentials,
             insecure,
