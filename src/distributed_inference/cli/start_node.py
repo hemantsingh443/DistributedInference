@@ -32,6 +32,14 @@ def main():
         help="Custom node ID (default: auto-generated)"
     )
     parser.add_argument(
+        "--max-cached-requests", type=int, default=1,
+        help="Maximum concurrent request KV caches per node (default: 1)"
+    )
+    parser.add_argument(
+        "--max-cache-tokens", type=int, default=4096,
+        help="Maximum cached tokens per request on each node (default: 4096)"
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)"
@@ -47,6 +55,8 @@ def main():
         max_vram_mb=args.max_vram_mb,
         device=args.device,
         node_id=args.node_id,
+        max_cached_requests=args.max_cached_requests,
+        max_cache_tokens_per_request=args.max_cache_tokens,
     )
 
     agent.start(block=True)

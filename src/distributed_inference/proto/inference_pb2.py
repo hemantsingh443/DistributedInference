@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\x15\x64istributed_inference\"8\n\nTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"\xe9\x01\n\x0e\x41\x63tivationData\x12\x38\n\rhidden_states\x18\x01 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x39\n\x0e\x61ttention_mask\x18\x02 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x37\n\x0cposition_ids\x18\x03 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x12\n\nrequest_id\x18\x04 \x01(\t\x12\x15\n\rcurrent_layer\x18\x05 \x01(\x05\"\x97\x01\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\x0f\n\x07vram_mb\x18\x03 \x01(\x03\x12\x16\n\x0e\x63ompute_tflops\x18\x04 \x01(\x02\x12\x16\n\x0e\x62\x61ndwidth_mbps\x18\x05 \x01(\x02\x12\x13\n\x0b\x64\x65vice_type\x18\x06 \x01(\t\x12\x13\n\x0b\x64\x65vice_name\x18\x07 \x01(\t\"\x8a\x02\n\nNodeStatus\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x38\n\x06status\x18\x02 \x01(\x0e\x32(.distributed_inference.NodeStatus.Status\x12\x14\n\x0cvram_used_mb\x18\x03 \x01(\x03\x12\x15\n\rvram_total_mb\x18\x04 \x01(\x03\x12\x17\n\x0f\x61ssigned_layers\x18\x05 \x03(\x05\x12\x14\n\x0cload_percent\x18\x06 \x01(\x02\x12\x14\n\x0ctimestamp_ms\x18\x07 \x01(\x03\"?\n\x06Status\x12\x08\n\x04IDLE\x10\x00\x12\x0b\n\x07LOADING\x10\x01\x12\t\n\x05READY\x10\x02\x12\x08\n\x04\x42USY\x10\x03\x12\t\n\x05\x45RROR\x10\x04\"\x88\x01\n\x0fShardAssignment\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x13\n\x0bstart_layer\x18\x02 \x01(\x05\x12\x11\n\tend_layer\x18\x03 \x01(\x05\x12\x15\n\rhas_embedding\x18\x04 \x01(\x08\x12\x13\n\x0bhas_lm_head\x18\x05 \x01(\x08\x12\r\n\x05\x64type\x18\x06 \x01(\t\"M\n\x0fRegistrationAck\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x18\n\x10\x61ssigned_node_id\x18\x03 \x01(\t\"}\n\x10InferenceRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x0e\n\x06prompt\x18\x02 \x01(\t\x12\x12\n\nmax_tokens\x18\x03 \x01(\x05\x12\x13\n\x0btemperature\x18\x04 \x01(\x02\x12\r\n\x05top_p\x18\x05 \x01(\x02\x12\r\n\x05top_k\x18\x06 \x01(\x05\"\xaa\x01\n\x11InferenceResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x16\n\x0egenerated_text\x18\x02 \x01(\t\x12\x18\n\x10tokens_generated\x18\x03 \x01(\x05\x12\x18\n\x10total_latency_ms\x18\x04 \x01(\x02\x12\x1a\n\x12per_hop_latency_ms\x18\x05 \x03(\x02\x12\x19\n\x11tokens_per_second\x18\x06 \x01(\x02\"\x8d\x01\n\x08HopEvent\x12\x0c\n\x04step\x18\x01 \x01(\x05\x12\x11\n\thop_index\x18\x02 \x01(\x05\x12\x0f\n\x07node_id\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x04 \x01(\t\x12\x13\n\x0bstart_layer\x18\x05 \x01(\x05\x12\x11\n\tend_layer\x18\x06 \x01(\x05\x12\x16\n\x0ehop_latency_ms\x18\x07 \x01(\x02\"Z\n\nTokenEvent\x12\x0c\n\x04step\x18\x01 \x01(\x05\x12\x10\n\x08token_id\x18\x02 \x01(\x05\x12\x12\n\ntoken_text\x18\x03 \x01(\t\x12\x18\n\x10\x61\x63\x63umulated_text\x18\x04 \x01(\t\"\xf9\x01\n\x0eInferenceEvent\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\x12.\n\x03hop\x18\x03 \x01(\x0b\x32\x1f.distributed_inference.HopEventH\x00\x12\x32\n\x05token\x18\x04 \x01(\x0b\x32!.distributed_inference.TokenEventH\x00\x12=\n\tcompleted\x18\x05 \x01(\x0b\x32(.distributed_inference.InferenceResponseH\x00\x12\x0f\n\x05\x65rror\x18\x06 \x01(\tH\x00\x42\t\n\x07payload\"\x07\n\x05\x45mpty\"F\n\x11HeartbeatResponse\x12\x31\n\x06status\x18\x01 \x01(\x0b\x32!.distributed_inference.NodeStatus2\xeb\x02\n\x0bNodeService\x12[\n\x0eLoadModelShard\x12&.distributed_inference.ShardAssignment\x1a!.distributed_inference.NodeStatus\x12Z\n\nRunForward\x12%.distributed_inference.ActivationData\x1a%.distributed_inference.ActivationData\x12S\n\tHeartbeat\x12\x1c.distributed_inference.Empty\x1a(.distributed_inference.HeartbeatResponse\x12N\n\x0bUnloadShard\x12\x1c.distributed_inference.Empty\x1a!.distributed_inference.NodeStatus2\x8f\x03\n\x12\x43oordinatorService\x12W\n\x0cRegisterNode\x12\x1f.distributed_inference.NodeInfo\x1a&.distributed_inference.RegistrationAck\x12O\n\x0cReportHealth\x12!.distributed_inference.NodeStatus\x1a\x1c.distributed_inference.Empty\x12\x64\n\x0fSubmitInference\x12\'.distributed_inference.InferenceRequest\x1a(.distributed_inference.InferenceResponse\x12i\n\x15SubmitInferenceStream\x12\'.distributed_inference.InferenceRequest\x1a%.distributed_inference.InferenceEvent0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\x15\x64istributed_inference\"8\n\nTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"\xbd\x02\n\x0e\x41\x63tivationData\x12\x38\n\rhidden_states\x18\x01 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x39\n\x0e\x61ttention_mask\x18\x02 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x37\n\x0cposition_ids\x18\x03 \x01(\x0b\x32!.distributed_inference.TensorData\x12\x12\n\nrequest_id\x18\x04 \x01(\t\x12\x15\n\rcurrent_layer\x18\x05 \x01(\x05\x12\x11\n\tuse_cache\x18\x06 \x01(\x08\x12\x13\n\x0breset_cache\x18\x07 \x01(\x08\x12\x16\n\x0e\x63\x61\x63he_position\x18\x08 \x01(\x03\x12\x12\n\nis_prefill\x18\t \x01(\x08\"\x97\x01\n\x08NodeInfo\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x02 \x01(\t\x12\x0f\n\x07vram_mb\x18\x03 \x01(\x03\x12\x16\n\x0e\x63ompute_tflops\x18\x04 \x01(\x02\x12\x16\n\x0e\x62\x61ndwidth_mbps\x18\x05 \x01(\x02\x12\x13\n\x0b\x64\x65vice_type\x18\x06 \x01(\t\x12\x13\n\x0b\x64\x65vice_name\x18\x07 \x01(\t\"\x8a\x02\n\nNodeStatus\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x38\n\x06status\x18\x02 \x01(\x0e\x32(.distributed_inference.NodeStatus.Status\x12\x14\n\x0cvram_used_mb\x18\x03 \x01(\x03\x12\x15\n\rvram_total_mb\x18\x04 \x01(\x03\x12\x17\n\x0f\x61ssigned_layers\x18\x05 \x03(\x05\x12\x14\n\x0cload_percent\x18\x06 \x01(\x02\x12\x14\n\x0ctimestamp_ms\x18\x07 \x01(\x03\"?\n\x06Status\x12\x08\n\x04IDLE\x10\x00\x12\x0b\n\x07LOADING\x10\x01\x12\t\n\x05READY\x10\x02\x12\x08\n\x04\x42USY\x10\x03\x12\t\n\x05\x45RROR\x10\x04\"\x88\x01\n\x0fShardAssignment\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x13\n\x0bstart_layer\x18\x02 \x01(\x05\x12\x11\n\tend_layer\x18\x03 \x01(\x05\x12\x15\n\rhas_embedding\x18\x04 \x01(\x08\x12\x13\n\x0bhas_lm_head\x18\x05 \x01(\x08\x12\r\n\x05\x64type\x18\x06 \x01(\t\"M\n\x0fRegistrationAck\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x18\n\x10\x61ssigned_node_id\x18\x03 \x01(\t\"}\n\x10InferenceRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x0e\n\x06prompt\x18\x02 \x01(\t\x12\x12\n\nmax_tokens\x18\x03 \x01(\x05\x12\x13\n\x0btemperature\x18\x04 \x01(\x02\x12\r\n\x05top_p\x18\x05 \x01(\x02\x12\r\n\x05top_k\x18\x06 \x01(\x05\"\xaa\x01\n\x11InferenceResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x16\n\x0egenerated_text\x18\x02 \x01(\t\x12\x18\n\x10tokens_generated\x18\x03 \x01(\x05\x12\x18\n\x10total_latency_ms\x18\x04 \x01(\x02\x12\x1a\n\x12per_hop_latency_ms\x18\x05 \x03(\x02\x12\x19\n\x11tokens_per_second\x18\x06 \x01(\x02\"\x8d\x01\n\x08HopEvent\x12\x0c\n\x04step\x18\x01 \x01(\x05\x12\x11\n\thop_index\x18\x02 \x01(\x05\x12\x0f\n\x07node_id\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x64\x64ress\x18\x04 \x01(\t\x12\x13\n\x0bstart_layer\x18\x05 \x01(\x05\x12\x11\n\tend_layer\x18\x06 \x01(\x05\x12\x16\n\x0ehop_latency_ms\x18\x07 \x01(\x02\"Z\n\nTokenEvent\x12\x0c\n\x04step\x18\x01 \x01(\x05\x12\x10\n\x08token_id\x18\x02 \x01(\x05\x12\x12\n\ntoken_text\x18\x03 \x01(\t\x12\x18\n\x10\x61\x63\x63umulated_text\x18\x04 \x01(\t\"\xf9\x01\n\x0eInferenceEvent\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x14\n\x0ctimestamp_ms\x18\x02 \x01(\x03\x12.\n\x03hop\x18\x03 \x01(\x0b\x32\x1f.distributed_inference.HopEventH\x00\x12\x32\n\x05token\x18\x04 \x01(\x0b\x32!.distributed_inference.TokenEventH\x00\x12=\n\tcompleted\x18\x05 \x01(\x0b\x32(.distributed_inference.InferenceResponseH\x00\x12\x0f\n\x05\x65rror\x18\x06 \x01(\tH\x00\x42\t\n\x07payload\"\x07\n\x05\x45mpty\"F\n\x11HeartbeatResponse\x12\x31\n\x06status\x18\x01 \x01(\x0b\x32!.distributed_inference.NodeStatus\"5\n\x0c\x43\x61\x63heControl\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x11\n\tclear_all\x18\x02 \x01(\x08\x32\xc3\x03\n\x0bNodeService\x12[\n\x0eLoadModelShard\x12&.distributed_inference.ShardAssignment\x1a!.distributed_inference.NodeStatus\x12Z\n\nRunForward\x12%.distributed_inference.ActivationData\x1a%.distributed_inference.ActivationData\x12S\n\tHeartbeat\x12\x1c.distributed_inference.Empty\x1a(.distributed_inference.HeartbeatResponse\x12N\n\x0bUnloadShard\x12\x1c.distributed_inference.Empty\x1a!.distributed_inference.NodeStatus\x12V\n\x11\x43learRequestCache\x12#.distributed_inference.CacheControl\x1a\x1c.distributed_inference.Empty2\x8f\x03\n\x12\x43oordinatorService\x12W\n\x0cRegisterNode\x12\x1f.distributed_inference.NodeInfo\x1a&.distributed_inference.RegistrationAck\x12O\n\x0cReportHealth\x12!.distributed_inference.NodeStatus\x1a\x1c.distributed_inference.Empty\x12\x64\n\x0fSubmitInference\x12\'.distributed_inference.InferenceRequest\x1a(.distributed_inference.InferenceResponse\x12i\n\x15SubmitInferenceStream\x12\'.distributed_inference.InferenceRequest\x1a%.distributed_inference.InferenceEvent0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,33 +34,35 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TENSORDATA']._serialized_start=42
   _globals['_TENSORDATA']._serialized_end=98
   _globals['_ACTIVATIONDATA']._serialized_start=101
-  _globals['_ACTIVATIONDATA']._serialized_end=334
-  _globals['_NODEINFO']._serialized_start=337
-  _globals['_NODEINFO']._serialized_end=488
-  _globals['_NODESTATUS']._serialized_start=491
-  _globals['_NODESTATUS']._serialized_end=757
-  _globals['_NODESTATUS_STATUS']._serialized_start=694
-  _globals['_NODESTATUS_STATUS']._serialized_end=757
-  _globals['_SHARDASSIGNMENT']._serialized_start=760
-  _globals['_SHARDASSIGNMENT']._serialized_end=896
-  _globals['_REGISTRATIONACK']._serialized_start=898
-  _globals['_REGISTRATIONACK']._serialized_end=975
-  _globals['_INFERENCEREQUEST']._serialized_start=977
-  _globals['_INFERENCEREQUEST']._serialized_end=1102
-  _globals['_INFERENCERESPONSE']._serialized_start=1105
-  _globals['_INFERENCERESPONSE']._serialized_end=1275
-  _globals['_HOPEVENT']._serialized_start=1278
-  _globals['_HOPEVENT']._serialized_end=1419
-  _globals['_TOKENEVENT']._serialized_start=1421
-  _globals['_TOKENEVENT']._serialized_end=1511
-  _globals['_INFERENCEEVENT']._serialized_start=1514
-  _globals['_INFERENCEEVENT']._serialized_end=1763
-  _globals['_EMPTY']._serialized_start=1765
-  _globals['_EMPTY']._serialized_end=1772
-  _globals['_HEARTBEATRESPONSE']._serialized_start=1774
-  _globals['_HEARTBEATRESPONSE']._serialized_end=1844
-  _globals['_NODESERVICE']._serialized_start=1847
-  _globals['_NODESERVICE']._serialized_end=2210
-  _globals['_COORDINATORSERVICE']._serialized_start=2213
-  _globals['_COORDINATORSERVICE']._serialized_end=2612
+  _globals['_ACTIVATIONDATA']._serialized_end=418
+  _globals['_NODEINFO']._serialized_start=421
+  _globals['_NODEINFO']._serialized_end=572
+  _globals['_NODESTATUS']._serialized_start=575
+  _globals['_NODESTATUS']._serialized_end=841
+  _globals['_NODESTATUS_STATUS']._serialized_start=778
+  _globals['_NODESTATUS_STATUS']._serialized_end=841
+  _globals['_SHARDASSIGNMENT']._serialized_start=844
+  _globals['_SHARDASSIGNMENT']._serialized_end=980
+  _globals['_REGISTRATIONACK']._serialized_start=982
+  _globals['_REGISTRATIONACK']._serialized_end=1059
+  _globals['_INFERENCEREQUEST']._serialized_start=1061
+  _globals['_INFERENCEREQUEST']._serialized_end=1186
+  _globals['_INFERENCERESPONSE']._serialized_start=1189
+  _globals['_INFERENCERESPONSE']._serialized_end=1359
+  _globals['_HOPEVENT']._serialized_start=1362
+  _globals['_HOPEVENT']._serialized_end=1503
+  _globals['_TOKENEVENT']._serialized_start=1505
+  _globals['_TOKENEVENT']._serialized_end=1595
+  _globals['_INFERENCEEVENT']._serialized_start=1598
+  _globals['_INFERENCEEVENT']._serialized_end=1847
+  _globals['_EMPTY']._serialized_start=1849
+  _globals['_EMPTY']._serialized_end=1856
+  _globals['_HEARTBEATRESPONSE']._serialized_start=1858
+  _globals['_HEARTBEATRESPONSE']._serialized_end=1928
+  _globals['_CACHECONTROL']._serialized_start=1930
+  _globals['_CACHECONTROL']._serialized_end=1983
+  _globals['_NODESERVICE']._serialized_start=1986
+  _globals['_NODESERVICE']._serialized_end=2437
+  _globals['_COORDINATORSERVICE']._serialized_start=2440
+  _globals['_COORDINATORSERVICE']._serialized_end=2839
 # @@protoc_insertion_point(module_scope)

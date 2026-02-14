@@ -330,6 +330,9 @@ class Orchestrator:
 
         start_time = time.time()
         request_id = request_id or uuid.uuid4().hex[:8]
+        use_kv_cache = bool(
+            getattr(self.config.inference, "enable_kv_cache", False)
+        )
 
         inputs = self._tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
@@ -338,71 +341,185 @@ class Orchestrator:
         all_hop_latencies = []
         generated_tokens = 0
 
-        for step in range(max_tokens):
-            logits = None
-
-            for trace in self.router.route_forward_stream(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                execution_plan=self._execution_plan,
-                request_id=f"{request_id}-step{step}",
-            ):
-                logits = trace.output
-                all_hop_latencies.append(trace.hop_latency_ms)
-                yield inference_pb2.InferenceEvent(
+        try:
+            if use_kv_cache:
+                logits = None
+                prefill_cache_pos = int(input_ids.shape[1] - 1)
+                for trace in self.router.route_forward_stream(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    execution_plan=self._execution_plan,
                     request_id=request_id,
-                    timestamp_ms=int(time.time() * 1000),
-                    hop=inference_pb2.HopEvent(
-                        step=step,
-                        hop_index=trace.hop_index,
-                        node_id=trace.stage.node_id,
-                        address=trace.stage.address,
-                        start_layer=trace.stage.start_layer,
-                        end_layer=trace.stage.end_layer,
-                        hop_latency_ms=trace.hop_latency_ms,
-                    ),
-                )
+                    use_cache=True,
+                    reset_cache=True,
+                    cache_position=prefill_cache_pos,
+                    is_prefill=True,
+                ):
+                    logits = trace.output
+                    all_hop_latencies.append(trace.hop_latency_ms)
+                    yield inference_pb2.InferenceEvent(
+                        request_id=request_id,
+                        timestamp_ms=int(time.time() * 1000),
+                        hop=inference_pb2.HopEvent(
+                            step=0,
+                            hop_index=trace.hop_index,
+                            node_id=trace.stage.node_id,
+                            address=trace.stage.address,
+                            start_layer=trace.stage.start_layer,
+                            end_layer=trace.stage.end_layer,
+                            hop_latency_ms=trace.hop_latency_ms,
+                        ),
+                    )
 
-            if logits is None:
-                raise RuntimeError("No logits returned from pipeline routing")
+                if logits is None:
+                    raise RuntimeError("No logits returned from prefill")
 
-            next_token = self._sample_next_token(
-                logits=logits,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
+                for step in range(max_tokens):
+                    if step > 0:
+                        decode_input = input_ids[:, -1:]
+                        decode_cache_pos = int(input_ids.shape[1] - 1)
+                        logits = None
+                        for trace in self.router.route_forward_stream(
+                            input_ids=decode_input,
+                            attention_mask=attention_mask,
+                            execution_plan=self._execution_plan,
+                            request_id=request_id,
+                            use_cache=True,
+                            reset_cache=False,
+                            cache_position=decode_cache_pos,
+                            is_prefill=False,
+                        ):
+                            logits = trace.output
+                            all_hop_latencies.append(trace.hop_latency_ms)
+                            yield inference_pb2.InferenceEvent(
+                                request_id=request_id,
+                                timestamp_ms=int(time.time() * 1000),
+                                hop=inference_pb2.HopEvent(
+                                    step=step,
+                                    hop_index=trace.hop_index,
+                                    node_id=trace.stage.node_id,
+                                    address=trace.stage.address,
+                                    start_layer=trace.stage.start_layer,
+                                    end_layer=trace.stage.end_layer,
+                                    hop_latency_ms=trace.hop_latency_ms,
+                                ),
+                            )
+                        if logits is None:
+                            raise RuntimeError(
+                                f"No logits returned on decode step {step}"
+                            )
 
-            if next_token.item() == self._tokenizer.eos_token_id:
-                break
+                    next_token = self._sample_next_token(
+                        logits=logits,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                    )
+                    if next_token.item() == self._tokenizer.eos_token_id:
+                        break
 
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            if attention_mask is not None:
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
-                    dim=-1,
-                )
+                    input_ids = torch.cat([input_ids, next_token], dim=-1)
+                    if attention_mask is not None:
+                        attention_mask = torch.cat(
+                            [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
+                            dim=-1,
+                        )
 
-            generated_tokens += 1
+                    generated_tokens += 1
+                    token_id = int(next_token.item())
+                    token_text = self._tokenizer.decode(
+                        [token_id], skip_special_tokens=False
+                    )
+                    accumulated_text = self._tokenizer.decode(
+                        input_ids[0], skip_special_tokens=True
+                    )
 
-            token_id = int(next_token.item())
-            token_text = self._tokenizer.decode(
-                [token_id], skip_special_tokens=False
-            )
-            accumulated_text = self._tokenizer.decode(
-                input_ids[0], skip_special_tokens=True
-            )
+                    yield inference_pb2.InferenceEvent(
+                        request_id=request_id,
+                        timestamp_ms=int(time.time() * 1000),
+                        token=inference_pb2.TokenEvent(
+                            step=step,
+                            token_id=token_id,
+                            token_text=token_text,
+                            accumulated_text=accumulated_text,
+                        ),
+                    )
+            else:
+                for step in range(max_tokens):
+                    logits = None
+                    for trace in self.router.route_forward_stream(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        execution_plan=self._execution_plan,
+                        request_id=f"{request_id}-step{step}",
+                        use_cache=False,
+                        reset_cache=False,
+                        cache_position=None,
+                        is_prefill=False,
+                    ):
+                        logits = trace.output
+                        all_hop_latencies.append(trace.hop_latency_ms)
+                        yield inference_pb2.InferenceEvent(
+                            request_id=request_id,
+                            timestamp_ms=int(time.time() * 1000),
+                            hop=inference_pb2.HopEvent(
+                                step=step,
+                                hop_index=trace.hop_index,
+                                node_id=trace.stage.node_id,
+                                address=trace.stage.address,
+                                start_layer=trace.stage.start_layer,
+                                end_layer=trace.stage.end_layer,
+                                hop_latency_ms=trace.hop_latency_ms,
+                            ),
+                        )
 
-            yield inference_pb2.InferenceEvent(
-                request_id=request_id,
-                timestamp_ms=int(time.time() * 1000),
-                token=inference_pb2.TokenEvent(
-                    step=step,
-                    token_id=token_id,
-                    token_text=token_text,
-                    accumulated_text=accumulated_text,
-                ),
-            )
+                    if logits is None:
+                        raise RuntimeError("No logits returned from pipeline routing")
+
+                    next_token = self._sample_next_token(
+                        logits=logits,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                    )
+                    if next_token.item() == self._tokenizer.eos_token_id:
+                        break
+
+                    input_ids = torch.cat([input_ids, next_token], dim=-1)
+                    if attention_mask is not None:
+                        attention_mask = torch.cat(
+                            [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
+                            dim=-1,
+                        )
+
+                    generated_tokens += 1
+                    token_id = int(next_token.item())
+                    token_text = self._tokenizer.decode(
+                        [token_id], skip_special_tokens=False
+                    )
+                    accumulated_text = self._tokenizer.decode(
+                        input_ids[0], skip_special_tokens=True
+                    )
+
+                    yield inference_pb2.InferenceEvent(
+                        request_id=request_id,
+                        timestamp_ms=int(time.time() * 1000),
+                        token=inference_pb2.TokenEvent(
+                            step=step,
+                            token_id=token_id,
+                            token_text=token_text,
+                            accumulated_text=accumulated_text,
+                        ),
+                    )
+        finally:
+            if use_kv_cache and self._execution_plan:
+                try:
+                    self.router.clear_request_cache_on_pipeline(
+                        execution_plan=self._execution_plan,
+                        request_id=request_id,
+                    )
+                except Exception as e:
+                    log.warning(f"Cache cleanup failed for {request_id}: {e}")
 
         generated_text = self._tokenizer.decode(
             input_ids[0], skip_special_tokens=True

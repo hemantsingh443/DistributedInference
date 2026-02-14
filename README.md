@@ -2,7 +2,7 @@
 
 A prototype distributed inference system where multiple nodes collaboratively run forward-pass inference on a sharded LLM (TinyLlama 1.1B). Designed to validate dynamic model partitioning, measure communication overhead, and test fault tolerance.
 
-> **Note:** the caching of models are off, `executor.py` is only optimized for TinyLlama 1.1B or any similar architecture.
+> **Note:** request-scoped KV cache is supported for TinyLlama/Llama-like models on distributed layer shards. `executor.py` is currently optimized for TinyLlama 1.1B or similar architecture.
 
 ## Architecture
 
@@ -133,12 +133,42 @@ coordinator:
 inference:
   max_tokens: 50
   temperature: 0.7
+  enable_kv_cache: true
+
+node:
+  max_cached_requests: 1
+  max_cache_tokens_per_request: 4096
+  cache_eviction_policy: "lru"
 ```
+
+### KV Cache Performance Expectations
+
+With distributed KV cache enabled, prefill still processes the full prompt once, but decode steps reuse per-node cache instead of recomputing the full prefix every token.
+
+- **First token latency:** usually similar to no-cache mode.
+- **Decode token latency:** typically much lower than no-cache mode.
+- **Throughput:** commonly improves by about **2x to 5x** in practical runs.
+- **End-to-end latency (longer generations):** often reduced by around **30% to 70%**.
+
+Actual gains depend on prompt length, generated tokens, network overhead, and GPU/CPU characteristics.
+
+### Quick A/B Measurement
+
+Run the same prompt twice and compare reported `tok/s` and total latency:
+
+1. KV cache enabled:
+```bash
+python scripts/run_demo.py --num-nodes 3 --prompt "The future of AI is" --max-tokens 100
+```
+
+2. KV cache disabled (temporary config override):
+Set `inference.enable_kv_cache: false` in your config and rerun the same command.
 
 ## Key Design Decisions
 
 - **gRPC + Protobuf** for inter-node communication (portable, inspectable)
 - **Streaming inference RPC** for live token/hop telemetry to web clients
 - **Layer-wise pipeline parallelism** (minimal cross-node dependencies)
+- **Request-scoped distributed KV cache** (prefill + decode with per-node cache reuse)
 - **VRAM-proportional partitioning** (nodes get layers proportional to their VRAM)
 - **Simulated VRAM caps** via `--max-vram-mb` for local testing on a single GPU

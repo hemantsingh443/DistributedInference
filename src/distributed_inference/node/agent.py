@@ -40,6 +40,8 @@ class NodeAgent:
         max_vram_mb: Optional[int] = None,
         device: str = "auto",
         node_id: Optional[str] = None,
+        max_cached_requests: int = 1,
+        max_cache_tokens_per_request: int = 4096,
     ):
         self.port = port
         self.coordinator_address = coordinator_address
@@ -56,6 +58,8 @@ class NodeAgent:
             node_id=self.node_id,
             port=self.port,
             device_type=self.capabilities.device_type,
+            max_cached_requests=max_cached_requests,
+            max_cache_tokens_per_request=max_cache_tokens_per_request,
         )
 
         self._running = False

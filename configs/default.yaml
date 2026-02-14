@@ -22,6 +22,9 @@ node:
   host: "localhost"
   device: "auto"
   coordinator_address: "localhost:50050"
+  max_cached_requests: 1
+  max_cache_tokens_per_request: 4096
+  cache_eviction_policy: "lru"
 
 inference:
   max_tokens: 50
@@ -29,6 +32,7 @@ inference:
   top_p: 0.9
   top_k: 50
   do_sample: true
+  enable_kv_cache: true
 
 communication:
   compress_tensors: false

@@ -43,6 +43,9 @@ class NodeConfig:
     max_vram_mb: Optional[int] = None  # None = use all available
     device: str = "auto"  # "auto", "cuda", "cpu"
     coordinator_address: str = "localhost:50050"
+    max_cached_requests: int = 1
+    max_cache_tokens_per_request: int = 4096
+    cache_eviction_policy: str = "lru"
 
 
 @dataclass
@@ -53,6 +56,7 @@ class InferenceConfig:
     top_p: float = 0.9
     top_k: int = 50
     do_sample: bool = True
+    enable_kv_cache: bool = True
 
 
 @dataclass

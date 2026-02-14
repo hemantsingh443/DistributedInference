@@ -32,10 +32,20 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
     ShardExecutor for running forward passes on assigned model layers.
     """
 
-    def __init__(self, node_id: str, device_type: str = "cpu"):
+    def __init__(
+        self,
+        node_id: str,
+        device_type: str = "cpu",
+        max_cached_requests: int = 1,
+        max_cache_tokens_per_request: int = 4096,
+    ):
         self.node_id = node_id
         self.device_type = device_type
-        self.executor = ShardExecutor(device_type=device_type)
+        self.executor = ShardExecutor(
+            device_type=device_type,
+            max_cached_requests=max_cached_requests,
+            max_cache_tokens_per_request=max_cache_tokens_per_request,
+        )
         self._status = inference_pb2.NodeStatus.IDLE
         self._vram_total_mb = 0
 
@@ -102,6 +112,11 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                request_id=request.request_id,
+                use_cache=request.use_cache,
+                reset_cache=request.reset_cache,
+                cache_position=request.cache_position,
+                is_prefill=request.is_prefill,
             )
 
             # Serialize output
@@ -127,6 +142,10 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 position_ids=request.position_ids,  # Pass through
                 request_id=request.request_id,
                 current_layer=self.executor.end_layer,
+                use_cache=request.use_cache,
+                reset_cache=False,
+                cache_position=request.cache_position,
+                is_prefill=request.is_prefill,
             )
 
         except Exception as e:
@@ -149,6 +168,14 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
         self._status = inference_pb2.NodeStatus.IDLE
         return self._build_status()
 
+    def ClearRequestCache(self, request, context):
+        """Clear cache state for one request or all requests."""
+        if request.clear_all:
+            self.executor.clear_all_cache()
+        elif request.request_id:
+            self.executor.clear_request_cache(request.request_id)
+        return inference_pb2.Empty()
+
     def _build_status(self) -> inference_pb2.NodeStatus:
         """Build a NodeStatus protobuf message."""
         layer_info = self.executor.get_layer_info()
@@ -169,6 +196,8 @@ def create_node_server(
     node_id: str,
     port: int,
     device_type: str = "cpu",
+    max_cached_requests: int = 1,
+    max_cache_tokens_per_request: int = 4096,
     max_workers: int = 4,
 ) -> grpc.Server:
     """Create and configure a gRPC server for the node.
@@ -193,7 +222,12 @@ def create_node_server(
         options=options,
     )
 
-    servicer = NodeServiceImpl(node_id=node_id, device_type=device_type)
+    servicer = NodeServiceImpl(
+        node_id=node_id,
+        device_type=device_type,
+        max_cached_requests=max_cached_requests,
+        max_cache_tokens_per_request=max_cache_tokens_per_request,
+    )
     inference_pb2_grpc.add_NodeServiceServicer_to_server(servicer, server)
 
     server.add_insecure_port(f"[::]:{port}")

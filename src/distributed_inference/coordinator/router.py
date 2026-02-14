@@ -61,6 +61,10 @@ class ActivationRouter:
         attention_mask: Optional[torch.Tensor],
         execution_plan: ExecutionPlan,
         request_id: str = "",
+        use_cache: bool = False,
+        reset_cache: bool = False,
+        cache_position: Optional[int] = None,
+        is_prefill: bool = False,
     ) -> Tuple[torch.Tensor, List[float]]:
         """Route a forward pass through all pipeline stages.
 
@@ -80,6 +84,10 @@ class ActivationRouter:
             attention_mask=attention_mask,
             execution_plan=execution_plan,
             request_id=request_id,
+            use_cache=use_cache,
+            reset_cache=reset_cache,
+            cache_position=cache_position,
+            is_prefill=is_prefill,
         ):
             current_data = trace.output
             per_hop_latency.append(trace.hop_latency_ms)
@@ -94,6 +102,10 @@ class ActivationRouter:
         attention_mask: Optional[torch.Tensor],
         execution_plan: ExecutionPlan,
         request_id: str = "",
+        use_cache: bool = False,
+        reset_cache: bool = False,
+        cache_position: Optional[int] = None,
+        is_prefill: bool = False,
     ) -> Iterator[HopTrace]:
         """Route a forward pass and emit hop traces as they complete."""
         current_data = input_ids  # Start with input_ids
@@ -117,7 +129,12 @@ class ActivationRouter:
                 ),
                 request_id=request_id,
                 current_layer=stage.start_layer,
+                use_cache=use_cache,
+                reset_cache=reset_cache,
+                is_prefill=is_prefill,
             )
+            if cache_position is not None:
+                activation.cache_position = cache_position
 
             if attention_mask is not None:
                 mask_bytes = serialize_tensor(attention_mask)
@@ -154,6 +171,29 @@ class ActivationRouter:
                 output=current_data,
                 hop_latency_ms=hop_ms,
             )
+
+    def clear_request_cache_on_pipeline(
+        self,
+        execution_plan: ExecutionPlan,
+        request_id: str,
+        clear_all: bool = False,
+    ) -> None:
+        """Clear request cache across all pipeline stages."""
+        for stage in execution_plan.stages:
+            try:
+                stub = self._get_stub(stage.address)
+                stub.ClearRequestCache(
+                    inference_pb2.CacheControl(
+                        request_id=request_id,
+                        clear_all=clear_all,
+                    ),
+                    timeout=10,
+                )
+            except grpc.RpcError as e:
+                log.warning(
+                    f"Failed to clear cache on {stage.node_id}: "
+                    f"{e.code()} - {e.details()}"
+                )
 
     def load_shard_on_node(
         self,

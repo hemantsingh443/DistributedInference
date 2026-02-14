@@ -20,6 +20,10 @@ message ActivationData {
   TensorData position_ids = 3;
   string request_id = 4;
   int32 current_layer = 5;  // Track which layer we're at
+  bool use_cache = 6;
+  bool reset_cache = 7;
+  int64 cache_position = 8;
+  bool is_prefill = 9;
 }
 
 // Node capability information
@@ -127,6 +131,11 @@ message HeartbeatResponse {
   NodeStatus status = 1;
 }
 
+message CacheControl {
+  string request_id = 1;
+  bool clear_all = 2;
+}
+
 // ============================================================
 // Node Service — runs on each node
 // ============================================================
@@ -142,6 +151,9 @@ service NodeService {
 
   // Unload current shard (for re-partitioning)
   rpc UnloadShard(Empty) returns (NodeStatus);
+
+  // Clear cache state for a specific request or all requests.
+  rpc ClearRequestCache(CacheControl) returns (Empty);
 }
 
 // ============================================================

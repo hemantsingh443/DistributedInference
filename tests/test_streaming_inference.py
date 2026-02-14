@@ -43,10 +43,31 @@ class DummyRouter:
     def __init__(self, stage: PipelineStage):
         self.stage = stage
         self.calls = 0
+        self.route_calls = []
+        self.cleared_requests = []
 
-    def route_forward_stream(self, input_ids, attention_mask, execution_plan, request_id):
+    def route_forward_stream(
+        self,
+        input_ids,
+        attention_mask,
+        execution_plan,
+        request_id,
+        use_cache=False,
+        reset_cache=False,
+        cache_position=None,
+        is_prefill=False,
+    ):
         del attention_mask, execution_plan, request_id
         seq_len = input_ids.shape[1]
+        self.route_calls.append(
+            {
+                "seq_len": seq_len,
+                "use_cache": use_cache,
+                "reset_cache": reset_cache,
+                "cache_position": cache_position,
+                "is_prefill": is_prefill,
+            }
+        )
         logits = torch.zeros((1, seq_len, 8), dtype=torch.float32)
 
         # Step 0 -> token 4 (" world"), step 1 -> EOS (2).
@@ -60,6 +81,10 @@ class DummyRouter:
             output=logits,
             hop_latency_ms=8.0 + self.calls,
         )
+
+    def clear_request_cache_on_pipeline(self, execution_plan, request_id, clear_all=False):
+        del execution_plan, clear_all
+        self.cleared_requests.append(request_id)
 
 
 def _build_ready_orchestrator() -> Orchestrator:
@@ -130,3 +155,32 @@ def test_run_inference_consumes_stream_and_returns_final_response():
     assert response.generated_text == "Hello world"
     assert response.total_latency_ms >= 0
     assert len(response.per_hop_latency_ms) == 2
+
+
+def test_kv_cache_prefill_decode_and_cleanup_flow():
+    orchestrator = _build_ready_orchestrator()
+    orchestrator.config.inference.enable_kv_cache = True
+
+    _ = list(
+        orchestrator.run_inference_stream(
+            prompt="test",
+            max_tokens=3,
+            temperature=0.0,
+            request_id="stream-cache",
+        )
+    )
+
+    assert len(orchestrator.router.route_calls) == 2
+
+    first = orchestrator.router.route_calls[0]
+    assert first["is_prefill"] is True
+    assert first["use_cache"] is True
+    assert first["reset_cache"] is True
+    assert first["seq_len"] == 1
+
+    second = orchestrator.router.route_calls[1]
+    assert second["is_prefill"] is False
+    assert second["use_cache"] is True
+    assert second["seq_len"] == 1
+
+    assert orchestrator.router.cleared_requests == ["stream-cache"]
