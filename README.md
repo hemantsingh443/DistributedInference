@@ -20,7 +20,7 @@ Client → Coordinator → [Node 1] → [Node 2] → [Node 3] → Output
 | ------------------- | ---------------------------------------------------------------------------------- |
 | **Node Agent**      | Discovers GPU/CPU resources, loads model shards, serves gRPC forward-pass requests |
 | **Coordinator**     | Registers nodes, partitions model, routes activations, manages health              |
-| **Partitioner**     | VRAM-proportional greedy bin-packing of transformer layers                         |
+| **Partitioner**     | Compute-aware, memory-safe layer allocation using VRAM + compute + network signals |
 | **Router**          | Orchestrates sequential forward pass across pipeline stages                        |
 | **Fault Tolerance** | Heartbeat health monitoring, activation checkpointing, recovery                    |
 | **Profiler**        | Latency, throughput, and communication overhead measurement                        |
@@ -44,6 +44,8 @@ This starts coordinator + web UI, then lets you add/remove nodes at runtime from
 - **Web UI**: Dynamic Node Onboarding panel
 - **CLI**: `python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 ...`
 
+> **Capacity note:** the model is loaded only when aggregate feasible VRAM is enough. If nodes are admitted but total capacity is still insufficient, inference remains unavailable until more capacity joins.
+
 CLI examples:
 
 ```bash
@@ -60,7 +62,7 @@ python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000
 python -m distributed_inference.cli.start_coordinator --port 50050
 ```
 
-**Terminal 2 — Web gateway (optional but recommended for node management):**
+**Terminal 2 — Web gateway (required for `manage_nodes`):**
 
 ```bash
 python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coordinator localhost:50050
@@ -70,7 +72,8 @@ python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coo
 
 ```bash
 python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
-python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1536
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
 ```
 
 **List / stop dynamically managed nodes:**
@@ -127,6 +130,11 @@ model:
 coordinator:
   port: 50050
   heartbeat_interval_sec: 5.0
+  min_vram_mb: 512
+  min_compute_tflops: 0.5
+  gpu_required: false
+  rebalance_cooldown_sec: 5.0
+  memory_safety_margin: 0.9
 
 inference:
   max_tokens: 50
@@ -159,8 +167,10 @@ Run the same prompt twice and compare reported `tok/s` and total latency:
 python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0
 ```
 
-2. Add at least one node:
+2. Add sufficient capacity (example: three 1GB-cap nodes):
 ```bash
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
 python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
 ```
 
@@ -178,5 +188,6 @@ Set `inference.enable_kv_cache: false` in your config and rerun the same command
 - **Streaming inference RPC** for live token/hop telemetry to web clients
 - **Layer-wise pipeline parallelism** (minimal cross-node dependencies)
 - **Request-scoped distributed KV cache** (prefill + decode with per-node cache reuse)
-- **VRAM-proportional partitioning** (nodes get layers proportional to their VRAM)
+- **Admission-controlled onboarding** (threshold checks before node participation)
+- **Compute-aware partitioning** (VRAM fit + compute + network-aware layer allocation)
 - **Simulated VRAM caps** via `--max-vram-mb` for local testing on a single GPU
