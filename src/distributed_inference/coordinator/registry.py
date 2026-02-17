@@ -35,6 +35,11 @@ class RegisteredNode:
     bandwidth_mbps: float
     device_type: str
     device_name: str
+    sram_mb: int = 0
+    latency_ms: float = 0.0
+    effective_bandwidth_mbps: float = 0.0
+    admitted: bool = True
+    admission_reason: str = ""
 
     # Mutable state
     state: NodeState = NodeState.IDLE
@@ -68,6 +73,11 @@ class NodeRegistry:
         bandwidth_mbps: float = 1000.0,
         device_type: str = "cpu",
         device_name: str = "",
+        sram_mb: int = 0,
+        latency_ms: float = 0.0,
+        effective_bandwidth_mbps: float = 0.0,
+        admitted: bool = True,
+        admission_reason: str = "",
     ) -> RegisteredNode:
         """Register a new node or update an existing one.
 
@@ -92,13 +102,19 @@ class NodeRegistry:
                 bandwidth_mbps=bandwidth_mbps,
                 device_type=device_type,
                 device_name=device_name,
+                sram_mb=sram_mb,
+                latency_ms=latency_ms,
+                effective_bandwidth_mbps=effective_bandwidth_mbps,
+                admitted=admitted,
+                admission_reason=admission_reason,
                 last_heartbeat=time.time(),
             )
             self._nodes[node_id] = node
 
+            admission_suffix = "admitted" if admitted else f"rejected: {admission_reason}"
             log.info(
                 f"[bold green]Node registered:[/] {node_id} "
-                f"at {address} ({vram_mb}MB VRAM, {device_type})"
+                f"at {address} ({vram_mb}MB VRAM, {device_type}, {admission_suffix})"
             )
             self._notify_change("register", node)
             return node
@@ -140,6 +156,14 @@ class NodeRegistry:
             return [
                 n for n in self._nodes.values()
                 if n.state == NodeState.READY
+            ]
+
+    def get_admitted_active_nodes(self) -> List[RegisteredNode]:
+        """Get active nodes that are admitted for hosting model shards."""
+        with self._lock:
+            return [
+                n for n in self._nodes.values()
+                if n.admitted and n.state not in (NodeState.DEAD, NodeState.SUSPECT)
             ]
 
     def update_heartbeat(self, node_id: str, vram_used_mb: int = 0) -> None:

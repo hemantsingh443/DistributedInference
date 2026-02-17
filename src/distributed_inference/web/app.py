@@ -3,9 +3,15 @@
 import asyncio
 import json
 import os
+import shlex
+import socket
+import subprocess
+import sys
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Deque, Dict, Iterator, Tuple
@@ -15,12 +21,42 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from distributed_inference.common.logging import get_logger
 from distributed_inference.proto import inference_pb2
 from distributed_inference.proto import inference_pb2_grpc
 
 log = get_logger(__name__)
+
+
+@dataclass
+class ManagedNodeProcess:
+    """Runtime metadata for a node process managed by the web gateway."""
+
+    node_id: str
+    port: int
+    coordinator: str
+    cmd: list[str]
+    process: subprocess.Popen
+    created_at: float
+    registration_state: str = "pending"  # pending|admitted|rejected
+    registration_message: str = ""
+    log_tail: Deque[str] = field(default_factory=lambda: deque(maxlen=120))
+    lock: Lock = field(default_factory=Lock, repr=False)
+
+
+class JoinNodeRequest(BaseModel):
+    """Payload for dynamically launching a node process."""
+
+    node_id: str | None = None
+    coordinator: str | None = None
+    port: int | None = Field(default=None, ge=1024, le=65535)
+    device: str = Field(default="auto", pattern="^(auto|cuda|cpu)$")
+    max_vram_mb: int | None = Field(default=None, ge=128)
+    bandwidth_mbps: float | None = Field(default=None, gt=0)
+    latency_ms: float | None = Field(default=None, gt=0)
+    log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR)$")
 
 
 class RunLogStore:
@@ -96,6 +132,106 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
     return "error", payload
 
 
+def _is_port_available(port: int) -> bool:
+    """Best-effort check whether a localhost TCP port is free."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _coordinator_port_from_addr(address: str) -> int:
+    """Extract coordinator port from host:port address, fallback to 50050."""
+    try:
+        return int(address.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return 50050
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    """Terminate a subprocess best-effort."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+def _start_node_log_reader(managed: ManagedNodeProcess) -> None:
+    """Stream node stdout into tail logs and infer registration outcome."""
+    stdout = managed.process.stdout
+    if stdout is None:
+        return
+
+    def _reader() -> None:
+        for raw_line in stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            with managed.lock:
+                managed.log_tail.append(line)
+                if (
+                    managed.registration_state == "pending"
+                    and "Registered successfully" in line
+                ):
+                    managed.registration_state = "admitted"
+                    managed.registration_message = line
+                elif "Registration failed:" in line:
+                    managed.registration_state = "rejected"
+                    managed.registration_message = line.split(
+                        "Registration failed:", 1
+                    )[-1].strip()
+
+        # Reader EOF: if process exited before registration decision, mark rejected.
+        exit_code = managed.process.poll()
+        with managed.lock:
+            if managed.registration_state == "pending" and exit_code is not None:
+                managed.registration_state = "rejected"
+                if managed.registration_message:
+                    return
+                if managed.log_tail:
+                    managed.registration_message = managed.log_tail[-1]
+                else:
+                    managed.registration_message = (
+                        f"node process exited with code {exit_code}"
+                    )
+
+    thread = threading.Thread(
+        target=_reader,
+        daemon=True,
+        name=f"{managed.node_id}-stdout-reader",
+    )
+    thread.start()
+
+
+def _snapshot_managed_node(managed: ManagedNodeProcess) -> dict:
+    """Create API payload snapshot for a managed node."""
+    exit_code = managed.process.poll()
+    with managed.lock:
+        registration_state = managed.registration_state
+        registration_message = managed.registration_message
+        recent_logs = list(managed.log_tail)[-10:]
+    return {
+        "node_id": managed.node_id,
+        "port": managed.port,
+        "coordinator": managed.coordinator,
+        "pid": managed.process.pid,
+        "running": exit_code is None,
+        "exit_code": exit_code,
+        "created_at": managed.created_at,
+        "cmd": " ".join(shlex.quote(token) for token in managed.cmd),
+        "registration_state": registration_state,
+        "registration_message": registration_message,
+        "recent_logs": recent_logs,
+    }
+
+
 def create_app(default_coordinator: str | None = None) -> FastAPI:
     """Create the FastAPI app instance."""
     base_dir = Path(__file__).resolve().parent
@@ -110,6 +246,12 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
         or "localhost:50050"
     )
     app.state.logs = RunLogStore(max_events_per_run=5000)
+    app.state.project_root = base_dir.parents[2]
+    app.state.managed_nodes: dict[str, ManagedNodeProcess] = {}
+    app.state.managed_nodes_lock = Lock()
+    app.state.next_node_port = _coordinator_port_from_addr(
+        app.state.default_coordinator
+    ) + 1
 
     @app.on_event("startup")
     async def _install_exception_filter() -> None:
@@ -133,6 +275,15 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
 
         loop.set_exception_handler(_handler)
 
+    @app.on_event("shutdown")
+    async def _terminate_managed_nodes() -> None:
+        """Best-effort cleanup for node processes launched by the web UI/API."""
+        with app.state.managed_nodes_lock:
+            managed_nodes = list(app.state.managed_nodes.values())
+            app.state.managed_nodes.clear()
+        for managed in managed_nodes:
+            _stop_process(managed.process)
+
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
         return templates.TemplateResponse(
@@ -145,18 +296,24 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
 
     @app.get("/health")
     def health(request: Request):
+        with request.app.state.managed_nodes_lock:
+            managed_nodes = len(request.app.state.managed_nodes)
         return {
             "status": "ok",
             "coordinator": request.app.state.default_coordinator,
+            "managed_nodes": managed_nodes,
         }
 
     @app.get("/api/health-fragment", response_class=HTMLResponse)
     def health_fragment(request: Request):
         coordinator = request.app.state.default_coordinator
+        with request.app.state.managed_nodes_lock:
+            managed_nodes = len(request.app.state.managed_nodes)
         return (
             "<span class='health-dot'></span>"
             "<span>Web ready</span>"
             f"<span class='muted'>Coordinator: {coordinator}</span>"
+            f"<span class='muted'>Managed nodes: {managed_nodes}</span>"
         )
 
     @app.get("/api/runs/{request_id}")
@@ -165,6 +322,174 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
         if not events:
             raise HTTPException(status_code=404, detail="request_id not found")
         return JSONResponse({"request_id": request_id, "events": events})
+
+    @app.get("/api/nodes")
+    def list_managed_nodes(request: Request):
+        """List node processes launched via web controls."""
+        with request.app.state.managed_nodes_lock:
+            nodes = [
+                _snapshot_managed_node(managed)
+                for managed in request.app.state.managed_nodes.values()
+            ]
+        nodes.sort(key=lambda item: item["created_at"], reverse=True)
+        return JSONResponse({"nodes": nodes})
+
+    @app.post("/api/nodes/join")
+    def join_node(request: Request, payload: JoinNodeRequest):
+        """Spawn a new node process with caller-provided resource profile."""
+        with request.app.state.managed_nodes_lock:
+            node_id = payload.node_id or f"web-node-{uuid.uuid4().hex[:8]}"
+            existing = request.app.state.managed_nodes.get(node_id)
+            if existing and existing.process.poll() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"node_id '{node_id}' is already running",
+                )
+
+            port = payload.port
+            if port is None:
+                cursor = max(request.app.state.next_node_port, 1024)
+                while not _is_port_available(cursor):
+                    cursor += 1
+                port = cursor
+                request.app.state.next_node_port = cursor + 1
+            elif not _is_port_available(port):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Port {port} is already in use",
+                )
+
+            coordinator = payload.coordinator or request.app.state.default_coordinator
+            cmd = [
+                sys.executable,
+                "-m",
+                "distributed_inference.cli.start_node",
+                "--port",
+                str(port),
+                "--coordinator",
+                coordinator,
+                "--device",
+                payload.device,
+                "--node-id",
+                node_id,
+                "--require-registration",
+                "--log-level",
+                payload.log_level,
+            ]
+            if payload.max_vram_mb is not None:
+                cmd.extend(["--max-vram-mb", str(payload.max_vram_mb)])
+            if payload.bandwidth_mbps is not None:
+                cmd.extend(["--bandwidth-mbps", str(payload.bandwidth_mbps)])
+            if payload.latency_ms is not None:
+                cmd.extend(["--latency-ms", str(payload.latency_ms)])
+
+            env = dict(os.environ)
+            src_path = str(request.app.state.project_root / "src")
+            existing_pythonpath = env.get("PYTHONPATH")
+            if existing_pythonpath:
+                env["PYTHONPATH"] = f"{src_path}{os.pathsep}{existing_pythonpath}"
+            else:
+                env["PYTHONPATH"] = src_path
+
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(request.app.state.project_root),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            managed = ManagedNodeProcess(
+                node_id=node_id,
+                port=port,
+                coordinator=coordinator,
+                cmd=cmd,
+                process=process,
+                created_at=time.time(),
+            )
+            _start_node_log_reader(managed)
+            request.app.state.managed_nodes[node_id] = managed
+
+        deadline = time.time() + 12.0
+        while time.time() < deadline:
+            snapshot = _snapshot_managed_node(managed)
+            if snapshot["registration_state"] == "admitted":
+                return JSONResponse(
+                    {
+                        "success": True,
+                        "node_id": node_id,
+                        "port": port,
+                        "coordinator": coordinator,
+                        "pid": process.pid,
+                        "cmd": " ".join(shlex.quote(token) for token in cmd),
+                        "admitted": True,
+                        "registration_state": "admitted",
+                        "registration_message": snapshot["registration_message"],
+                    }
+                )
+            if snapshot["registration_state"] == "rejected":
+                _stop_process(process)
+                with request.app.state.managed_nodes_lock:
+                    request.app.state.managed_nodes.pop(node_id, None)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        snapshot["registration_message"]
+                        or "Node rejected by coordinator admission policy"
+                    ),
+                )
+            if snapshot["exit_code"] is not None:
+                with request.app.state.managed_nodes_lock:
+                    request.app.state.managed_nodes.pop(node_id, None)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        snapshot["registration_message"]
+                        or f"Node exited early with code {snapshot['exit_code']}"
+                    ),
+                )
+            time.sleep(0.1)
+
+        snapshot = _snapshot_managed_node(managed)
+        return JSONResponse(
+            {
+                "success": True,
+                "node_id": node_id,
+                "port": port,
+                "coordinator": coordinator,
+                "pid": process.pid,
+                "cmd": " ".join(shlex.quote(token) for token in cmd),
+                "admitted": False,
+                "registration_state": snapshot["registration_state"],
+                "registration_message": snapshot["registration_message"],
+            }
+        )
+
+    @app.post("/api/nodes/{node_id}/stop")
+    def stop_node(request: Request, node_id: str):
+        """Stop a node process launched by this web process."""
+        with request.app.state.managed_nodes_lock:
+            managed = request.app.state.managed_nodes.get(node_id)
+            if not managed:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Managed node '{node_id}' not found",
+                )
+
+        process = managed.process
+        _stop_process(process)
+
+        with request.app.state.managed_nodes_lock:
+            request.app.state.managed_nodes.pop(node_id, None)
+
+        return JSONResponse(
+            {
+                "success": True,
+                "node_id": node_id,
+                "exit_code": process.poll(),
+            }
+        )
 
     @app.get("/api/stream")
     def stream_inference(

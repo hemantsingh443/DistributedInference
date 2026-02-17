@@ -3,10 +3,7 @@
 import grpc
 import warnings
 
-try:
-    from . import inference_pb2 as inference__pb2
-except ImportError:  # pragma: no cover - fallback for direct execution
-    import inference_pb2 as inference__pb2
+from . import inference_pb2 as inference__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__

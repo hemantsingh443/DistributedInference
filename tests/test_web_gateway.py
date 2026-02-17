@@ -1,5 +1,6 @@
 """Tests for the FastAPI web gateway SSE layer."""
 
+import io
 import importlib
 
 import pytest
@@ -57,6 +58,31 @@ class _FakeStub:
         )
 
 
+class _FakeProcess:
+    _pid_counter = 9999
+
+    def __init__(self, *, logs: str = ""):
+        type(self)._pid_counter += 1
+        self.pid = type(self)._pid_counter
+        self._exit_code = None
+        self.stdout = io.StringIO(logs)
+
+    def poll(self):
+        return self._exit_code
+
+    def terminate(self):
+        self._exit_code = 0
+
+    def wait(self, timeout=None):
+        del timeout
+        if self._exit_code is None:
+            self._exit_code = 0
+        return self._exit_code
+
+    def kill(self):
+        self._exit_code = -9
+
+
 def test_sse_stream_and_run_log_capture(monkeypatch):
     monkeypatch.setattr(
         web_app_module.grpc,
@@ -91,3 +117,80 @@ def test_sse_stream_and_run_log_capture(monkeypatch):
     assert payload["request_id"] == "req-web-1"
     assert payload["events"][0]["type"] == "start"
     assert payload["events"][-1]["type"] == "completed"
+
+
+def test_dynamic_node_api_join_list_stop(monkeypatch):
+    monkeypatch.setattr(web_app_module, "_is_port_available", lambda port: True)
+    monkeypatch.setattr(
+        web_app_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            logs="Registered successfully: Node web-node-1 registered successfully\n"
+        ),
+    )
+
+    app = web_app_module.create_app(default_coordinator="localhost:50050")
+    client = TestClient(app)
+
+    join_payload = {
+        "node_id": "web-node-1",
+        "port": 50061,
+        "device": "cpu",
+        "max_vram_mb": 1024,
+        "bandwidth_mbps": 900,
+        "latency_ms": 8,
+    }
+    join_resp = client.post("/api/nodes/join", json=join_payload)
+    assert join_resp.status_code == 200
+    joined = join_resp.json()
+    assert joined["success"] is True
+    assert joined["node_id"] == "web-node-1"
+    assert joined["port"] == 50061
+    assert joined["admitted"] is True
+
+    list_resp = client.get("/api/nodes")
+    assert list_resp.status_code == 200
+    listed = list_resp.json()["nodes"]
+    assert len(listed) == 1
+    assert listed[0]["node_id"] == "web-node-1"
+    assert listed[0]["running"] is True
+
+    stop_resp = client.post("/api/nodes/web-node-1/stop")
+    assert stop_resp.status_code == 200
+    stopped = stop_resp.json()
+    assert stopped["success"] is True
+    assert stopped["node_id"] == "web-node-1"
+
+    list_after = client.get("/api/nodes").json()["nodes"]
+    assert list_after == []
+
+
+def test_dynamic_node_join_rejection_surfaces_error(monkeypatch):
+    monkeypatch.setattr(web_app_module, "_is_port_available", lambda port: True)
+    monkeypatch.setattr(
+        web_app_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            logs=(
+                "Registration failed: Node web-node-2 rejected "
+                "(Insufficient VRAM: 256MB < minimum 512MB)\n"
+            )
+        ),
+    )
+
+    app = web_app_module.create_app(default_coordinator="localhost:50050")
+    client = TestClient(app)
+    join_resp = client.post(
+        "/api/nodes/join",
+        json={
+            "node_id": "web-node-2",
+            "port": 50062,
+            "device": "cpu",
+            "max_vram_mb": 256,
+        },
+    )
+
+    assert join_resp.status_code == 400
+    assert "Insufficient VRAM" in join_resp.json()["detail"]
+    listed = client.get("/api/nodes").json()["nodes"]
+    assert listed == []

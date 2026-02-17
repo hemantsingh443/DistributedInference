@@ -23,10 +23,13 @@ class NodeCapabilities:
     vram_total_mb: int  # Total physical VRAM
     compute_tflops: float  # Estimated compute in TFLOPS
     bandwidth_mbps: float  # Estimated network bandwidth
+    effective_bandwidth_mbps: float  # Effective bandwidth for scheduler
+    latency_ms: float  # Estimated base network latency to coordinator
     device_type: str  # "cuda" or "cpu"
     device_name: str  # Human-readable device name
     cpu_count: int
     ram_mb: int
+    sram_mb: int  # Shared memory / SRAM estimate where available
 
     def summary(self) -> str:
         """Return a human-readable summary of capabilities."""
@@ -34,6 +37,7 @@ class NodeCapabilities:
             f"{self.device_name} | "
             f"VRAM: {self.vram_mb}MB / {self.vram_total_mb}MB | "
             f"Compute: {self.compute_tflops:.1f} TFLOPS | "
+            f"Net: {self.effective_bandwidth_mbps:.0f}Mbps/{self.latency_ms:.1f}ms | "
             f"Device: {self.device_type}"
         )
 
@@ -41,6 +45,8 @@ class NodeCapabilities:
 def detect_resources(
     max_vram_mb: Optional[int] = None,
     device: str = "auto",
+    bandwidth_mbps: Optional[float] = None,
+    latency_ms: Optional[float] = None,
 ) -> NodeCapabilities:
     """Detect available compute resources on this node.
 
@@ -85,11 +91,17 @@ def detect_resources(
             vram_mb=vram_mb,
             vram_total_mb=vram_total_mb,
             compute_tflops=round(compute_tflops, 2),
-            bandwidth_mbps=1000.0,  # Default estimate
+            bandwidth_mbps=bandwidth_mbps or 1000.0,
+            effective_bandwidth_mbps=bandwidth_mbps or 1000.0,
+            latency_ms=latency_ms or 5.0,
             device_type="cuda",
             device_name=device_name,
             cpu_count=cpu_count,
             ram_mb=ram_mb,
+            sram_mb=(
+                getattr(props, "shared_memory_per_multiprocessor", 0)
+                * getattr(props, "multi_processor_count", 0)
+            ) // (1024 * 1024),
         )
     else:
         # CPU-only node
@@ -101,11 +113,14 @@ def detect_resources(
             vram_mb=vram_mb,
             vram_total_mb=vram_total_mb,
             compute_tflops=0.1 * cpu_count,  # Rough CPU estimate
-            bandwidth_mbps=1000.0,
+            bandwidth_mbps=bandwidth_mbps or 1000.0,
+            effective_bandwidth_mbps=bandwidth_mbps or 1000.0,
+            latency_ms=latency_ms or 5.0,
             device_type="cpu",
             device_name=f"CPU ({platform.processor() or 'unknown'})",
             cpu_count=cpu_count,
             ram_mb=ram_mb,
+            sram_mb=0,
         )
 
     log.info(f"Detected resources: {capabilities.summary()}")

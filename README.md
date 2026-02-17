@@ -34,23 +34,25 @@ cd DistributedInference
 pip install -e ".[dev]"
 ```
 
-### Run the Demo (All-in-One)
+### Run Web + Dynamic Onboarding
 
 ```bash
-python scripts/run_demo.py --num-nodes 3 --prompt "The future of AI is" --max-tokens 30
+python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0 --open-browser
 ```
 
-This spawns a coordinator + 3 simulated nodes (with different VRAM caps), partitions TinyLlama across them, runs inference, and prints metrics.
+This starts coordinator + web UI, then lets you add/remove nodes at runtime from:
+- **Web UI**: Dynamic Node Onboarding panel
+- **CLI**: `python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 ...`
 
-### Run the Web Stack (All-in-One)
+CLI examples:
 
 ```bash
-python scripts/run_web_demo.py --num-nodes 3 --web-port 8000 --open-browser
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 list
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 stop --node-id web-node-1234abcd
 ```
 
-This starts coordinator + nodes + web gateway in one command and keeps them running for interactive prompts and live hop/token streaming.
-
-### Manual Setup
+### CLI Dynamic Workflow
 
 **Terminal 1 — Coordinator:**
 
@@ -58,37 +60,33 @@ This starts coordinator + nodes + web gateway in one command and keeps them runn
 python -m distributed_inference.cli.start_coordinator --port 50050
 ```
 
-**Terminal 2 — Node 1 (512MB VRAM cap):**
+**Terminal 2 — Web gateway (optional but recommended for node management):**
 
 ```bash
-python -m distributed_inference.cli.start_node --port 50051 --coordinator localhost:50050 --max-vram-mb 512 --node-id node-1
+python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coordinator localhost:50050
 ```
 
-**Terminal 3 — Node 2 (1GB VRAM cap):**
+**Terminal 3 — Dynamically add nodes from CLI:**
 
 ```bash
-python -m distributed_inference.cli.start_node --port 50052 --coordinator localhost:50050 --max-vram-mb 1024 --node-id node-2
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1536
 ```
 
-**Terminal 4 — Node 3 (1.5GB VRAM cap):**
+**List / stop dynamically managed nodes:**
 
 ```bash
-python -m distributed_inference.cli.start_node --port 50053 --coordinator localhost:50050 --max-vram-mb 1536 --node-id node-3
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 list
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 stop --node-id <node-id>
 ```
 
-**Terminal 5 — Run Inference:**
+**Run inference from CLI:**
 
 ```bash
 python -m distributed_inference.cli.run_inference --coordinator localhost:50050 --prompt "Once upon a time" --max-tokens 50
 ```
 
 ### Web Inference Console (Live Hop + Token Stream)
-
-After coordinator and nodes are running:
-
-```bash
-python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coordinator localhost:50050
-```
 
 Open `http://127.0.0.1:8000` in your browser to:
 - submit prompts from a UI
@@ -156,12 +154,22 @@ Actual gains depend on prompt length, generated tokens, network overhead, and GP
 
 Run the same prompt twice and compare reported `tok/s` and total latency:
 
-1. KV cache enabled:
+1. Start coordinator + web dynamic stack:
 ```bash
-python scripts/run_demo.py --num-nodes 3 --prompt "The future of AI is" --max-tokens 100
+python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0
 ```
 
-2. KV cache disabled (temporary config override):
+2. Add at least one node:
+```bash
+python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
+```
+
+3. KV cache enabled inference:
+```bash
+python -m distributed_inference.cli.run_inference --coordinator localhost:50050 --prompt "The future of AI is" --max-tokens 100
+```
+
+4. KV cache disabled (temporary config override):
 Set `inference.enable_kv_cache: false` in your config and rerun the same command.
 
 ## Key Design Decisions

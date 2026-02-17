@@ -67,12 +67,16 @@ class Scheduler:
         transfer_overhead_ms: float = 10.0,  # Fixed overhead per hop
         mb_per_activation: float = 8.0,  # Typical activation size in MB
         bandwidth_mbps_default: float = 1000.0,  # Default bandwidth
+        latency_ms_default: float = 5.0,
+        reference_tflops: float = 10.0,
     ):
         self.registry = registry
         self.ms_per_layer = ms_per_layer
         self.transfer_overhead_ms = transfer_overhead_ms
         self.mb_per_activation = mb_per_activation
         self.bandwidth_mbps_default = bandwidth_mbps_default
+        self.latency_ms_default = latency_ms_default
+        self.reference_tflops = reference_tflops
 
     def create_execution_plan(
         self,
@@ -104,13 +108,25 @@ class Scheduler:
 
             # Estimate compute time
             num_layers = assignment.end_layer - assignment.start_layer
-            compute_ms = num_layers * self.ms_per_layer
+            compute_tflops = max(node.compute_tflops if node else 0.1, 0.1)
+            compute_scale = self.reference_tflops / compute_tflops
+            compute_ms = num_layers * self.ms_per_layer * compute_scale
 
             # Estimate transfer time (except for the last stage)
             transfer_ms = 0.0
             if i < len(sorted_assignments) - 1:
-                bandwidth = node.bandwidth_mbps if node else self.bandwidth_mbps_default
+                bandwidth = (
+                    node.effective_bandwidth_mbps
+                    if node and node.effective_bandwidth_mbps > 0
+                    else (node.bandwidth_mbps if node else self.bandwidth_mbps_default)
+                )
+                latency_ms = (
+                    node.latency_ms
+                    if node and node.latency_ms > 0
+                    else self.latency_ms_default
+                )
                 transfer_ms = (
+                    latency_ms +
                     self.transfer_overhead_ms +
                     (self.mb_per_activation / bandwidth) * 1000  # Convert to ms
                 )

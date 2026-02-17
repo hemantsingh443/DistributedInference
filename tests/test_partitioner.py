@@ -118,7 +118,7 @@ class TestPartitionModel:
 
     def test_plan_summary(self, model_config):
         """Partition plan summary is human-readable."""
-        nodes = [make_node("node-0", 2048)]
+        nodes = [make_node("node-0", 4096)]
         plan = partition_model(nodes, model_config)
         summary = plan.summary()
         assert "test-model" in summary

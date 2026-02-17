@@ -55,6 +55,60 @@
       </form>
     </section>
 
+    <section class="panel nodes">
+      <div class="panel-title">Dynamic Node Onboarding</div>
+      <form id="node-form">
+        <div class="grid node-grid">
+          <label>Coordinator
+            <input id="node_coordinator" name="coordinator" value="{{ default_coordinator }}" />
+          </label>
+          <label>Node ID (optional)
+            <input id="node_id" name="node_id" placeholder="web-node-..." />
+          </label>
+          <label>Port (optional)
+            <input id="node_port" name="port" type="number" min="1024" max="65535" placeholder="auto" />
+          </label>
+          <label>Device
+            <input id="node_device" name="device" value="auto" />
+          </label>
+          <label>VRAM Cap MB (optional)
+            <input id="node_max_vram_mb" name="max_vram_mb" type="number" min="128" placeholder="1024" />
+          </label>
+          <label>Bandwidth Mbps (optional)
+            <input id="node_bandwidth_mbps" name="bandwidth_mbps" type="number" min="1" step="1" placeholder="1000" />
+          </label>
+          <label>Latency ms (optional)
+            <input id="node_latency_ms" name="latency_ms" type="number" min="0.1" step="0.1" placeholder="5.0" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="join-btn" type="submit">Join Node</button>
+          <button id="refresh-nodes-btn" type="button" class="secondary">Refresh Nodes</button>
+          <span id="node-status" class="muted">No managed nodes</span>
+        </div>
+      </form>
+
+      <div class="panel-title">CLI Equivalent</div>
+      <pre id="cli-preview" class="text-stream cli-preview"></pre>
+
+      <div class="panel-title">Managed Nodes</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Port</th>
+              <th>PID</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="nodes-body"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="panel output">
       <div class="panel-title">Generated Text</div>
       <pre id="generated-text" class="text-stream"></pre>

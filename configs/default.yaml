@@ -17,6 +17,16 @@ coordinator:
   heartbeat_timeout_sec: 15.0
   failure_threshold: 3
   max_concurrent_requests: 4
+  min_vram_mb: 512
+  min_compute_tflops: 0.5
+  gpu_required: false
+  rebalance_cooldown_sec: 5.0
+  rebalance_drain_timeout_sec: 30.0
+  allocation_alpha_latency: 0.7
+  allocation_beta_throughput: 0.3
+  default_bandwidth_mbps: 1000.0
+  default_latency_ms: 5.0
+  memory_safety_margin: 0.9
 
 node:
   host: "localhost"

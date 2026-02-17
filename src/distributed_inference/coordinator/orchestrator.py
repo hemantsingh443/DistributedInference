@@ -19,7 +19,9 @@ from transformers import AutoTokenizer
 
 from distributed_inference.common.config import SystemConfig, load_config
 from distributed_inference.common.logging import get_logger
+from distributed_inference.coordinator.admission import AdmissionController
 from distributed_inference.coordinator.partitioner import partition_model, PartitionPlan
+from distributed_inference.coordinator.rebalancer import RebalanceController
 from distributed_inference.coordinator.registry import NodeRegistry, NodeState
 from distributed_inference.coordinator.router import ActivationRouter
 from distributed_inference.coordinator.scheduler import Scheduler, ExecutionPlan
@@ -27,6 +29,14 @@ from distributed_inference.proto import inference_pb2
 from distributed_inference.proto import inference_pb2_grpc
 
 log = get_logger(__name__)
+
+
+class NodeLoadError(RuntimeError):
+    """Raised when a specific node cannot accept/load an assigned shard."""
+
+    def __init__(self, node_id: str, message: str):
+        super().__init__(message)
+        self.node_id = node_id
 
 
 class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
@@ -40,6 +50,25 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
 
     def RegisterNode(self, request, context):
         """Handle node registration."""
+        decision = self.orchestrator.admission.evaluate(
+            vram_mb=request.vram_mb,
+            compute_tflops=request.compute_tflops,
+            device_type=request.device_type,
+        )
+
+        if not decision.admitted:
+            log.warning(
+                f"Rejected node registration {request.node_id}: {decision.reason}"
+            )
+            return inference_pb2.RegistrationAck(
+                success=False,
+                message=f"Node {request.node_id} rejected",
+                assigned_node_id=request.node_id,
+                admission_status=inference_pb2.RegistrationAck.REJECTED,
+                rejection_reason=decision.reason,
+                rebalance_plan_version=self.orchestrator.plan_version,
+            )
+
         node = self.orchestrator.registry.register(
             node_id=request.node_id,
             address=request.address,
@@ -48,12 +77,20 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             bandwidth_mbps=request.bandwidth_mbps,
             device_type=request.device_type,
             device_name=request.device_name,
+            sram_mb=request.sram_mb,
+            latency_ms=request.latency_ms,
+            effective_bandwidth_mbps=request.effective_bandwidth_mbps,
+            admitted=True,
+            admission_reason="",
         )
 
         return inference_pb2.RegistrationAck(
             success=True,
             message=f"Node {request.node_id} registered successfully",
             assigned_node_id=request.node_id,
+            admission_status=inference_pb2.RegistrationAck.ADMITTED,
+            rejection_reason="",
+            rebalance_plan_version=self.orchestrator.plan_version,
         )
 
     def ReportHealth(self, request, context):
@@ -132,7 +169,12 @@ class Orchestrator:
         self.config = config or load_config()
         self.registry = NodeRegistry()
         self.router = ActivationRouter()
-        self.scheduler = Scheduler(registry=self.registry)
+        self.scheduler = Scheduler(
+            registry=self.registry,
+            bandwidth_mbps_default=self.config.coordinator.default_bandwidth_mbps,
+            latency_ms_default=self.config.coordinator.default_latency_ms,
+        )
+        self.admission = AdmissionController(self.config.coordinator)
 
         self._partition_plan: Optional[PartitionPlan] = None
         self._execution_plan: Optional[ExecutionPlan] = None
@@ -141,11 +183,28 @@ class Orchestrator:
         self._running = False
         self._model_loaded = False
         self._health_thread: Optional[threading.Thread] = None
+        self._state_lock = threading.RLock()
+        self._active_requests = 0
+        self._accepting_requests = True
+        self._plan_version = 0
+        self._last_rebalance_reason = ""
+        self._rebalance_lock = threading.RLock()
+        self._rebalance_controller = RebalanceController(
+            callback=self._rebalance_pipeline,
+            cooldown_sec=self.config.coordinator.rebalance_cooldown_sec,
+        )
+
+        self.registry.on_change(self._on_registry_change)
 
     @property
     def is_ready(self) -> bool:
         """Whether the system is ready to serve inference requests."""
         return self._model_loaded and self._partition_plan is not None
+
+    @property
+    def plan_version(self) -> str:
+        """Current active rebalance plan version."""
+        return f"v{self._plan_version}"
 
     def start(self, block: bool = True) -> None:
         """Start the coordinator gRPC server.
@@ -174,6 +233,7 @@ class Orchestrator:
         self._server.add_insecure_port(f"{host}:{port}")
         self._server.start()
         self._running = True
+        self._rebalance_controller.start()
 
         log.info(f"[bold blue]Coordinator started[/] on {host}:{port}")
 
@@ -195,6 +255,7 @@ class Orchestrator:
         """Stop the coordinator."""
         log.info("Stopping coordinator...")
         self._running = False
+        self._rebalance_controller.stop()
         if self._server:
             self._server.stop(grace=5)
         self.router.close()
@@ -214,64 +275,217 @@ class Orchestrator:
         start = time.time()
 
         while time.time() - start < timeout:
-            active = self.registry.active_count
+            active = len(self.registry.get_admitted_active_nodes())
             if active >= min_nodes:
                 log.info(f"Got {active} nodes, proceeding")
                 return True
             time.sleep(1.0)
 
         log.warning(
-            f"Timeout: only {self.registry.active_count}/{min_nodes} nodes registered"
+            f"Timeout: only {len(self.registry.get_admitted_active_nodes())}/{min_nodes} nodes registered"
         )
-        return self.registry.active_count > 0
+        return len(self.registry.get_admitted_active_nodes()) > 0
 
     def setup_model(self) -> None:
         """Partition the model and load shards onto nodes.
 
         Must be called after nodes have registered.
         """
-        active_nodes = self.registry.get_active_nodes()
-        if not active_nodes:
-            raise RuntimeError("No active nodes available for model setup")
+        nodes = self.registry.get_admitted_active_nodes()
+        if not nodes:
+            raise RuntimeError("No admitted active nodes available for model setup")
+        self._ensure_tokenizer()
+        self._rebalance_controller.run_now("initial_setup")
 
-        log.info(f"Setting up model with {len(active_nodes)} nodes")
-
-        # Load tokenizer
+    def _ensure_tokenizer(self) -> None:
+        """Load tokenizer lazily and exactly once."""
+        if self._tokenizer is not None:
+            return
         log.info(f"Loading tokenizer for {self.config.model.name}")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.model.name)
 
-        # Create partition plan
-        self._partition_plan = partition_model(
-            nodes=active_nodes,
-            model_config=self.config.model,
-        )
+    def _on_registry_change(self, event: str, _node) -> None:
+        """Schedule a rebalance for topology-changing events."""
+        if event in {"register", "unregister", "dead"}:
+            self._rebalance_controller.request(f"topology:{event}")
 
-        # Create execution plan
-        self._execution_plan = self.scheduler.create_execution_plan(
-            self._partition_plan
-        )
+    def _rebalance_pipeline(self, reason: str) -> bool:
+        """Recompute and apply partitioning with drain-then-swap cutover."""
+        if not self._running and reason != "initial_setup":
+            return False
 
-        # Load shards on each node
-        for assignment in self._partition_plan.assignments:
+        with self._rebalance_lock:
+            start = time.time()
+            self._ensure_tokenizer()
+
+            old_plan = self._partition_plan
+            old_execution = self._execution_plan
+            old_loaded = self._model_loaded
+            last_error: Optional[Exception] = None
+            applied = False
+
+            self._begin_drain()
+            drained = self._wait_for_drain(
+                timeout_sec=self.config.coordinator.rebalance_drain_timeout_sec
+            )
+            if not drained:
+                log.warning(
+                    "Rebalance proceeding after drain timeout with active requests still running"
+                )
+
+            try:
+                for attempt in range(1, 4):
+                    nodes = self._get_rebalance_candidate_nodes()
+                    if not nodes:
+                        break
+
+                    try:
+                        new_plan = partition_model(
+                            nodes=nodes,
+                            model_config=self.config.model,
+                            alpha_latency=self.config.coordinator.allocation_alpha_latency,
+                            beta_throughput=self.config.coordinator.allocation_beta_throughput,
+                            default_bandwidth_mbps=self.config.coordinator.default_bandwidth_mbps,
+                            default_latency_ms=self.config.coordinator.default_latency_ms,
+                            memory_safety_margin=self.config.coordinator.memory_safety_margin,
+                        )
+                    except ValueError as e:
+                        last_error = e
+                        log.warning(
+                            f"Rebalance attempt {attempt} cannot produce feasible plan: {e}"
+                        )
+                        break
+                    new_execution = self.scheduler.create_execution_plan(new_plan)
+
+                    try:
+                        self._load_partition_plan(new_plan)
+                        with self._state_lock:
+                            self._partition_plan = new_plan
+                            self._execution_plan = new_execution
+                            self._model_loaded = True
+                            self._plan_version += 1
+                            self._last_rebalance_reason = reason
+                        self._unload_removed_nodes(old_plan, new_plan)
+                        elapsed_ms = (time.time() - start) * 1000
+                        log.info(
+                            f"Rebalance complete ({self.plan_version}, reason={reason}) "
+                            f"in {elapsed_ms:.0f}ms"
+                        )
+                        applied = True
+                        break
+                    except NodeLoadError as e:
+                        last_error = e
+                        self.registry.mark_dead(e.node_id)
+                        log.warning(
+                            f"Rebalance attempt {attempt} failed at node {e.node_id}: {e}. "
+                            "Retrying with remaining healthy nodes."
+                        )
+                    except Exception as e:
+                        last_error = e
+                        log.error(
+                            f"Rebalance attempt {attempt} failed ({reason}): {e}"
+                        )
+                        break
+
+                if applied:
+                    return True
+
+                if (
+                    old_plan
+                    and old_execution
+                    and old_loaded
+                    and self._is_plan_viable(old_plan)
+                ):
+                    with self._state_lock:
+                        self._partition_plan = old_plan
+                        self._execution_plan = old_execution
+                        self._model_loaded = old_loaded
+                    log.warning(
+                        "Rebalance failed; retained last known-good execution plan"
+                    )
+                else:
+                    with self._state_lock:
+                        self._model_loaded = False
+                        self._partition_plan = None
+                        self._execution_plan = None
+                    log.error(
+                        "Rebalance failed and no viable last known-good plan is available"
+                    )
+
+                message = (
+                    f"Rebalance failed ({reason})"
+                    + (f": {last_error}" if last_error else "")
+                )
+                if reason == "initial_setup":
+                    raise RuntimeError(message)
+                log.error(message)
+                return False
+            finally:
+                self._end_drain()
+
+    def _get_rebalance_candidate_nodes(self):
+        """Return admitted nodes currently reachable for shard placement."""
+        candidates = []
+        for node in self.registry.get_admitted_active_nodes():
+            health = self.router.check_node_health(node.address)
+            if health is None:
+                self.registry.mark_suspect(node.node_id)
+                log.warning(
+                    f"Excluding unreachable node from rebalance: "
+                    f"{node.node_id} @ {node.address}"
+                )
+                continue
+            candidates.append(node)
+        return candidates
+
+    def _is_plan_viable(self, plan: PartitionPlan) -> bool:
+        """Check whether a plan only references currently live/reachable nodes."""
+        active_ids = {n.node_id for n in self.registry.get_admitted_active_nodes()}
+        plan_ids = {assignment.node_id for assignment in plan.assignments}
+        if not plan_ids.issubset(active_ids):
+            return False
+        for assignment in plan.assignments:
+            node = self.registry.get_node(assignment.node_id)
+            if not node:
+                return False
+            if self.router.check_node_health(node.address) is None:
+                return False
+        return True
+
+    def _load_partition_plan(self, plan: PartitionPlan) -> None:
+        """Load a partition plan onto nodes and update registry assignments."""
+        active_assignments = {
+            assignment.node_id: assignment for assignment in plan.assignments
+        }
+
+        for assignment in plan.assignments:
             node = self.registry.get_node(assignment.node_id)
             if not node:
                 raise RuntimeError(f"Node {assignment.node_id} not found")
 
-            log.info(
-                f"Loading shard on {node.node_id}: "
-                f"layers [{assignment.start_layer}, {assignment.end_layer})"
-            )
-
-            self.router.load_shard_on_node(
-                address=node.address,
-                model_name=self.config.model.name,
-                start_layer=assignment.start_layer,
-                end_layer=assignment.end_layer,
-                has_embedding=assignment.has_embedding,
-                has_lm_head=assignment.has_lm_head,
-                dtype=self.config.model.dtype,
-            )
-
+            self.registry.set_node_state(node.node_id, NodeState.LOADING)
+            if self.router.check_node_health(node.address) is None:
+                raise NodeLoadError(
+                    node_id=node.node_id,
+                    message=(
+                        f"Node {node.node_id} became unreachable before shard load"
+                    ),
+                )
+            try:
+                self.router.load_shard_on_node(
+                    address=node.address,
+                    model_name=self.config.model.name,
+                    start_layer=assignment.start_layer,
+                    end_layer=assignment.end_layer,
+                    has_embedding=assignment.has_embedding,
+                    has_lm_head=assignment.has_lm_head,
+                    dtype=self.config.model.dtype,
+                )
+            except Exception as e:
+                raise NodeLoadError(
+                    node_id=node.node_id,
+                    message=f"Shard load failed on {node.node_id}: {e}",
+                ) from e
             self.registry.set_node_assignment(
                 node_id=assignment.node_id,
                 start_layer=assignment.start_layer,
@@ -280,8 +494,60 @@ class Orchestrator:
                 has_lm_head=assignment.has_lm_head,
             )
 
-        self._model_loaded = True
-        log.info("[bold green]Model setup complete — ready for inference[/]")
+        for node in self.registry.get_all_nodes():
+            if node.node_id not in active_assignments and node.admitted:
+                node.assigned_layers = (0, 0)
+                node.has_embedding = False
+                node.has_lm_head = False
+                if node.state not in (NodeState.DEAD, NodeState.SUSPECT):
+                    node.state = NodeState.IDLE
+
+    def _unload_removed_nodes(
+        self,
+        old_plan: Optional[PartitionPlan],
+        new_plan: PartitionPlan,
+    ) -> None:
+        """Unload shards from nodes removed in a new partition plan."""
+        if not old_plan:
+            return
+        old_nodes = {assignment.node_id for assignment in old_plan.assignments}
+        new_nodes = {assignment.node_id for assignment in new_plan.assignments}
+        removed = old_nodes - new_nodes
+        for node_id in removed:
+            node = self.registry.get_node(node_id)
+            if not node:
+                continue
+            if self.router.check_node_health(node.address) is None:
+                continue
+            self.router.unload_shard_on_node(node.address)
+
+    def _begin_drain(self) -> None:
+        with self._state_lock:
+            self._accepting_requests = False
+
+    def _end_drain(self) -> None:
+        with self._state_lock:
+            self._accepting_requests = True
+
+    def _wait_for_drain(self, timeout_sec: float) -> bool:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            with self._state_lock:
+                if self._active_requests == 0:
+                    return True
+            time.sleep(0.05)
+        with self._state_lock:
+            return self._active_requests == 0
+
+    def _enter_request(self) -> None:
+        with self._state_lock:
+            if not self._accepting_requests:
+                raise RuntimeError("Coordinator is rebalancing; retry shortly")
+            self._active_requests += 1
+
+    def _exit_request(self) -> None:
+        with self._state_lock:
+            self._active_requests = max(self._active_requests - 1, 0)
 
     def run_inference(
         self,
@@ -323,32 +589,35 @@ class Orchestrator:
         request_id: str = "",
     ) -> Iterator[inference_pb2.InferenceEvent]:
         """Run inference and yield streaming hop/token/completion events."""
-        if not self.is_ready:
-            raise RuntimeError("Model not set up. Call setup_model() first.")
-        if not self._execution_plan:
-            raise RuntimeError("No execution plan available")
-
-        start_time = time.time()
-        request_id = request_id or uuid.uuid4().hex[:8]
-        use_kv_cache = bool(
-            getattr(self.config.inference, "enable_kv_cache", False)
-        )
-
-        inputs = self._tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask")
-
-        all_hop_latencies = []
-        generated_tokens = 0
-
+        self._enter_request()
         try:
+            if not self.is_ready:
+                raise RuntimeError("Model not set up. Call setup_model() first.")
+            with self._state_lock:
+                execution_plan = self._execution_plan
+            if not execution_plan:
+                raise RuntimeError("No execution plan available")
+
+            start_time = time.time()
+            request_id = request_id or uuid.uuid4().hex[:8]
+            use_kv_cache = bool(
+                getattr(self.config.inference, "enable_kv_cache", False)
+            )
+
+            inputs = self._tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask")
+
+            all_hop_latencies = []
+            generated_tokens = 0
+
             if use_kv_cache:
                 logits = None
                 prefill_cache_pos = int(input_ids.shape[1] - 1)
                 for trace in self.router.route_forward_stream(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    execution_plan=self._execution_plan,
+                    execution_plan=execution_plan,
                     request_id=request_id,
                     use_cache=True,
                     reset_cache=True,
@@ -382,7 +651,7 @@ class Orchestrator:
                         for trace in self.router.route_forward_stream(
                             input_ids=decode_input,
                             attention_mask=attention_mask,
-                            execution_plan=self._execution_plan,
+                            execution_plan=execution_plan,
                             request_id=request_id,
                             use_cache=True,
                             reset_cache=False,
@@ -450,7 +719,7 @@ class Orchestrator:
                     for trace in self.router.route_forward_stream(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        execution_plan=self._execution_plan,
+                        execution_plan=execution_plan,
                         request_id=f"{request_id}-step{step}",
                         use_cache=False,
                         reset_cache=False,
@@ -512,22 +781,20 @@ class Orchestrator:
                         ),
                     )
         finally:
-            if use_kv_cache and self._execution_plan:
+            if 'use_kv_cache' in locals() and use_kv_cache and execution_plan:
                 try:
                     self.router.clear_request_cache_on_pipeline(
-                        execution_plan=self._execution_plan,
+                        execution_plan=execution_plan,
                         request_id=request_id,
                     )
                 except Exception as e:
                     log.warning(f"Cache cleanup failed for {request_id}: {e}")
+            self._exit_request()
 
-        generated_text = self._tokenizer.decode(
-            input_ids[0], skip_special_tokens=True
-        )
+        generated_text = self._tokenizer.decode(input_ids[0], skip_special_tokens=True)
         total_time_ms = (time.time() - start_time) * 1000
         tokens_per_sec = (
-            generated_tokens / (total_time_ms / 1000)
-            if total_time_ms > 0 else 0
+            generated_tokens / (total_time_ms / 1000) if total_time_ms > 0 else 0
         )
 
         log.info(

@@ -1,6 +1,7 @@
 """CLI entry point for starting a node agent."""
 
 import argparse
+import sys
 
 from distributed_inference.common.logging import setup_logging
 from distributed_inference.node.agent import NodeAgent
@@ -40,6 +41,18 @@ def main():
         help="Maximum cached tokens per request on each node (default: 4096)"
     )
     parser.add_argument(
+        "--bandwidth-mbps", type=float, default=None,
+        help="Optional self-reported network bandwidth in Mbps"
+    )
+    parser.add_argument(
+        "--latency-ms", type=float, default=None,
+        help="Optional self-reported base network latency in ms"
+    )
+    parser.add_argument(
+        "--require-registration", action="store_true",
+        help="Exit immediately if initial registration is rejected/failed"
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)"
@@ -57,9 +70,16 @@ def main():
         node_id=args.node_id,
         max_cached_requests=args.max_cached_requests,
         max_cache_tokens_per_request=args.max_cache_tokens,
+        bandwidth_mbps=args.bandwidth_mbps,
+        latency_ms=args.latency_ms,
+        require_registration_success=args.require_registration,
     )
 
-    agent.start(block=True)
+    try:
+        agent.start(block=True)
+    except RuntimeError as e:
+        print(f"Node startup failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

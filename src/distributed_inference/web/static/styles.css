@@ -124,6 +124,10 @@ input:focus {
   grid-template-columns: repeat(5, minmax(120px, 1fr));
 }
 
+.node-grid {
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+}
+
 .actions {
   margin-top: 12px;
   display: flex;
@@ -145,6 +149,11 @@ button:hover {
   filter: brightness(1.05);
 }
 
+button.secondary {
+  background: rgba(24, 32, 39, 0.14);
+  color: var(--ink);
+}
+
 .text-stream {
   margin: 0;
   min-height: 120px;
@@ -152,6 +161,11 @@ button:hover {
   font-family: "JetBrains Mono", monospace;
   font-size: 0.92rem;
   line-height: 1.45;
+}
+
+.cli-preview {
+  min-height: 44px;
+  font-size: 0.78rem;
 }
 
 .metrics {

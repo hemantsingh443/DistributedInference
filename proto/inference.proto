@@ -35,6 +35,9 @@ message NodeInfo {
   float bandwidth_mbps = 5;
   string device_type = 6;   // "cuda" or "cpu"
   string device_name = 7;
+  int64 sram_mb = 8;
+  float latency_ms = 9;
+  float effective_bandwidth_mbps = 10;
 }
 
 // Node health/status report
@@ -70,6 +73,14 @@ message RegistrationAck {
   bool success = 1;
   string message = 2;
   string assigned_node_id = 3;
+
+  enum AdmissionStatus {
+    ADMITTED = 0;
+    REJECTED = 1;
+  }
+  AdmissionStatus admission_status = 4;
+  string rejection_reason = 5;
+  string rebalance_plan_version = 6;
 }
 
 // Inference request from client

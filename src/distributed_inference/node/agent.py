@@ -42,6 +42,9 @@ class NodeAgent:
         node_id: Optional[str] = None,
         max_cached_requests: int = 1,
         max_cache_tokens_per_request: int = 4096,
+        bandwidth_mbps: Optional[float] = None,
+        latency_ms: Optional[float] = None,
+        require_registration_success: bool = False,
     ):
         self.port = port
         self.coordinator_address = coordinator_address
@@ -51,6 +54,8 @@ class NodeAgent:
         self.capabilities = detect_resources(
             max_vram_mb=max_vram_mb,
             device=device,
+            bandwidth_mbps=bandwidth_mbps,
+            latency_ms=latency_ms,
         )
 
         # Create gRPC server
@@ -65,6 +70,8 @@ class NodeAgent:
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_interval = 5.0
+        self._require_registration_success = require_registration_success
+        self._last_registration_error = ""
 
     def start(self, block: bool = True) -> None:
         """Start the node agent.
@@ -87,7 +94,13 @@ class NodeAgent:
         log.info(f"gRPC server started on port {self.port}")
 
         # Register with coordinator
-        self._register_with_coordinator()
+        registered = self._register_with_coordinator()
+        if not registered and self._require_registration_success:
+            reason = self._last_registration_error or "registration failed"
+            self.stop()
+            raise RuntimeError(
+                f"Initial registration failed (require_registration_success): {reason}"
+            )
 
         # Start heartbeat thread
         self._heartbeat_thread = threading.Thread(
@@ -136,6 +149,9 @@ class NodeAgent:
                 bandwidth_mbps=self.capabilities.bandwidth_mbps,
                 device_type=self.capabilities.device_type,
                 device_name=self.capabilities.device_name,
+                sram_mb=self.capabilities.sram_mb,
+                latency_ms=self.capabilities.latency_ms,
+                effective_bandwidth_mbps=self.capabilities.effective_bandwidth_mbps,
             )
 
             response = stub.RegisterNode(node_info, timeout=10)
@@ -145,12 +161,19 @@ class NodeAgent:
                     f"[bold green]Registered successfully[/]: "
                     f"{response.message}"
                 )
+                self._last_registration_error = ""
                 return True
             else:
-                log.error(f"Registration failed: {response.message}")
+                rejection = (
+                    f" ({response.rejection_reason})"
+                    if response.rejection_reason else ""
+                )
+                self._last_registration_error = f"{response.message}{rejection}"
+                log.error(f"Registration failed: {self._last_registration_error}")
                 return False
 
         except grpc.RpcError as e:
+            self._last_registration_error = f"{e.code().name}: {e.details()}"
             log.warning(
                 f"Could not reach coordinator: {e.code()} - {e.details()}"
             )

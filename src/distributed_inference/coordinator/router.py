@@ -250,6 +250,18 @@ class ActivationRouter:
         except grpc.RpcError:
             return None
 
+    def unload_shard_on_node(self, address: str) -> Optional[inference_pb2.NodeStatus]:
+        """Instruct a node to unload any currently loaded shard."""
+        try:
+            stub = self._get_stub(address)
+            return stub.UnloadShard(inference_pb2.Empty(), timeout=60)
+        except grpc.RpcError as e:
+            log.warning(
+                f"Failed to unload shard on {address}: "
+                f"{e.code()} - {e.details()}"
+            )
+            return None
+
     def close(self) -> None:
         """Close all gRPC channels."""
         for channel in self._channels.values():

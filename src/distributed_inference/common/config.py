@@ -33,6 +33,16 @@ class CoordinatorConfig:
     heartbeat_timeout_sec: float = 15.0
     failure_threshold: int = 3  # Missed heartbeats before marking dead
     max_concurrent_requests: int = 4
+    min_vram_mb: int = 512
+    min_compute_tflops: float = 0.5
+    gpu_required: bool = False
+    rebalance_cooldown_sec: float = 5.0
+    rebalance_drain_timeout_sec: float = 30.0
+    allocation_alpha_latency: float = 0.7
+    allocation_beta_throughput: float = 0.3
+    default_bandwidth_mbps: float = 1000.0
+    default_latency_ms: float = 5.0
+    memory_safety_margin: float = 0.9
 
 
 @dataclass
