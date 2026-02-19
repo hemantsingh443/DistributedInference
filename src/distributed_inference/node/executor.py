@@ -4,17 +4,28 @@ Loads specific transformer layers from a HuggingFace model and runs
 inference on them. Handles both first-node (embedding) and last-node
 (lm_head) special components.
 
+Uses selective weight loading via safetensors to avoid loading the
+entire model into memory. Each node only downloads and materializes
+the exact layer weights it needs.
+
 Designed for transformers 5.x which requires using the model's own
 forward() method rather than calling individual layers directly.
 """
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import gc
+import json
+import os
+import re
+import threading
 import time
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file as safetensors_load_file
 from transformers import AutoModelForCausalLM, AutoConfig
 
 from distributed_inference.common.logging import get_logger
@@ -35,9 +46,12 @@ class ShardExecutor:
     """Executes forward passes on a subset of model layers.
 
     Loads specific transformer layers from a pre-trained model and runs
-    input tensors through them. Uses the model's own forward() method
-    to ensure compatibility with transformers 5.x internal masking
-    and positional embedding logic.
+    input tensors through them. Uses selective weight loading via
+    safetensors so each node only materializes its assigned layers,
+    avoiding full-model memory spikes.
+
+    Uses the model's own forward() method to ensure compatibility with
+    transformers 5.x internal masking and positional embedding logic.
     """
 
     def __init__(
@@ -53,6 +67,7 @@ class ShardExecutor:
         self.max_cached_requests = max(1, int(max_cached_requests))
         self.max_cache_tokens_per_request = max(1, int(max_cache_tokens_per_request))
         self._kv_cache_by_request: OrderedDict[str, CacheEntry] = OrderedDict()
+        self._cache_lock = threading.RLock()
 
         self.start_layer: int = 0
         self.end_layer: int = 0
@@ -63,6 +78,80 @@ class ShardExecutor:
     @property
     def loaded(self) -> bool:
         return self._loaded
+
+    @staticmethod
+    def _get_shard_weight_keys(
+        start_layer: int,
+        end_layer: int,
+        has_embedding: bool,
+        has_lm_head: bool,
+    ) -> set[str]:
+        """Build the set of weight-key prefixes this shard needs."""
+        prefixes: set[str] = set()
+        for i in range(start_layer, end_layer):
+            prefixes.add(f"model.layers.{i}.")
+        if has_embedding:
+            prefixes.add("model.embed_tokens.")
+        if has_lm_head:
+            prefixes.add("lm_head.")
+            prefixes.add("model.norm.")
+        return prefixes
+
+    @staticmethod
+    def _remap_layer_key(key: str, start_layer: int) -> str:
+        """Remap a full-model weight key to local shard indices.
+
+        E.g. ``model.layers.15.self_attn.q_proj.weight`` with
+        start_layer=15 becomes ``model.layers.0.self_attn.q_proj.weight``.
+        """
+        m = re.match(r"^(model\.layers\.)(\d+)(\..*)", key)
+        if m:
+            original_idx = int(m.group(2))
+            local_idx = original_idx - start_layer
+            return f"{m.group(1)}{local_idx}{m.group(3)}"
+        return key
+
+    def _resolve_safetensor_files(
+        self,
+        model_name: str,
+        needed_prefixes: set[str],
+    ) -> dict[str, dict[str, str]]:
+        """Determine which safetensor files contain needed weights.
+
+        Returns:
+            Dict mapping local file path -> {weight_key: ...} for each
+            key that matches a needed prefix.  The value dict maps
+            original weight key -> remapped weight key.
+        """
+        # Try sharded index first
+        try:
+            index_path = hf_hub_download(
+                model_name, "model.safetensors.index.json"
+            )
+            with open(index_path, "r") as f:
+                index_data = json.load(f)
+            weight_map: dict[str, str] = index_data["weight_map"]
+        except Exception:
+            # Single-file model — all weights live in one file
+            single_path = hf_hub_download(model_name, "model.safetensors")
+            weight_map = None  # handled below
+
+        if weight_map is None:
+            # Single file: return all matching keys from the single file
+            return {single_path: {}}  # empty dict → load all & filter later
+
+        # Sharded model: group needed keys by shard file
+        shard_files_needed: dict[str, dict[str, str]] = {}
+        repo_dir = os.path.dirname(index_path)
+        for weight_key, shard_filename in weight_map.items():
+            if any(weight_key.startswith(p) for p in needed_prefixes):
+                shard_path = os.path.join(repo_dir, shard_filename)
+                if not os.path.exists(shard_path):
+                    shard_path = hf_hub_download(model_name, shard_filename)
+                if shard_path not in shard_files_needed:
+                    shard_files_needed[shard_path] = {}
+                shard_files_needed[shard_path][weight_key] = weight_key
+        return shard_files_needed
 
     @torch.no_grad()
     def load_shard(
@@ -76,9 +165,10 @@ class ShardExecutor:
     ) -> dict:
         """Load specific layers from a pre-trained model.
 
-        Uses the full model's internal forward() for compatibility with
-        transformers 5.x. Loads the complete model, slices layers, and
-        updates config.num_hidden_layers to match.
+        Uses selective weight loading via safetensors to avoid
+        materializing the full model. Creates an empty model shell
+        with only the needed layers, then loads matching weights from
+        the safetensor files with layer-index remapping.
 
         Args:
             model_name: HuggingFace model name/path.
@@ -104,33 +194,75 @@ class ShardExecutor:
             f"dtype={dtype} device={self.device}"
         )
 
-        # Load model config
+        # Free previously loaded shard before constructing a new model to
+        # avoid transient peak-memory spikes during rebalance/reload.
+        if self._loaded:
+            self.unload()
+            gc.collect()
+
+        # Load model config and create an empty model shell with only
+        # the number of layers this shard needs.
         self.model_config = AutoConfig.from_pretrained(model_name)
-
-        # Load the full model
-        torch_dtype = torch.float16 if dtype == "float16" else torch.float32
-        full_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-        )
-
-        # Slice layers to only the ones we need
         num_layers = end_layer - start_layer
-        full_model.model.layers = nn.ModuleList(
-            list(full_model.model.layers[start_layer:end_layer])
+
+        original_num_layers = self.model_config.num_hidden_layers
+        self.model_config.num_hidden_layers = num_layers
+        self.model_config.use_cache = True
+
+        torch_dtype = torch.float16 if dtype == "float16" else torch.float32
+        # Construct empty model on CPU with meta weights to minimize memory
+        shell_model = AutoModelForCausalLM.from_config(
+            self.model_config,
+            torch_dtype=torch_dtype,
         )
-        # Reindex layer ids after slicing so cache slots are 0..num_layers-1.
-        # Llama attention cache updates use per-layer indices internally.
-        self._renumber_layer_indices(full_model.model.layers)
-        full_model.config.num_hidden_layers = num_layers
-        full_model.config.use_cache = True
+
+        # Determine which weight prefixes this shard needs
+        needed_prefixes = self._get_shard_weight_keys(
+            start_layer, end_layer, has_embedding, has_lm_head
+        )
+
+        # Resolve which safetensor files contain the needed weights
+        log.info(f"Resolving safetensor files for {len(needed_prefixes)} weight groups")
+        shard_file_map = self._resolve_safetensor_files(model_name, needed_prefixes)
+
+        # Load and remap weights from safetensor files
+        state_dict: dict[str, torch.Tensor] = {}
+        for shard_path, key_mapping in shard_file_map.items():
+            file_tensors = safetensors_load_file(shard_path, device="cpu")
+            for orig_key, tensor in file_tensors.items():
+                if any(orig_key.startswith(p) for p in needed_prefixes):
+                    remapped_key = self._remap_layer_key(orig_key, start_layer)
+                    state_dict[remapped_key] = tensor.to(torch_dtype)
+            del file_tensors
+
+        # Load the selective state dict into the model shell
+        missing, unexpected = shell_model.load_state_dict(state_dict, strict=False)
+        del state_dict
+
+        # Log any issues — some missing keys are expected for non-embed/non-lm_head nodes
+        if unexpected:
+            log.warning(f"Unexpected keys during shard load: {unexpected[:5]}")
+        expected_missing = set()
+        if not has_embedding:
+            expected_missing.add("model.embed_tokens.weight")
+        if not has_lm_head:
+            expected_missing.add("lm_head.weight")
+            expected_missing.add("model.norm.weight")
+        real_missing = [k for k in missing if k not in expected_missing]
+        if real_missing:
+            log.warning(
+                f"Missing {len(real_missing)} weight keys during shard load "
+                f"(first 5): {real_missing[:5]}"
+            )
+
+        # Reindex layer ids for cache slot alignment
+        self._renumber_layer_indices(shell_model.model.layers)
 
         # Store the inner model (LlamaModel) and optionally lm_head
-        self.model = full_model.model
+        self.model = shell_model.model
 
         if has_lm_head:
-            self.lm_head = full_model.lm_head
+            self.lm_head = shell_model.lm_head
         else:
             # Intermediate nodes: skip final RMSNorm (only last node applies it)
             self.model.norm = nn.Identity()
@@ -142,7 +274,7 @@ class ShardExecutor:
             self.lm_head = self.lm_head.to(self.device)
 
         # Free the wrapper
-        del full_model
+        del shell_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -292,7 +424,8 @@ class ShardExecutor:
         position_ids: Optional[torch.Tensor],
         cache_position: Optional[int],
     ) -> torch.Tensor:
-        entry = self._kv_cache_by_request.get(request_id)
+        with self._cache_lock:
+            entry = self._kv_cache_by_request.get(request_id)
         if entry is None:
             raise RuntimeError(
                 f"KV cache miss for request {request_id}. Prefill must run first."
@@ -404,17 +537,18 @@ class ShardExecutor:
             raise RuntimeError(
                 f"Model did not return past_key_values for request {request_id}"
             )
-        if request_id in self._kv_cache_by_request:
-            self._kv_cache_by_request.move_to_end(request_id)
-        elif len(self._kv_cache_by_request) >= self.max_cached_requests:
-            evicted_id, _ = self._kv_cache_by_request.popitem(last=False)
-            log.warning(f"Evicted KV cache for request {evicted_id} (LRU)")
+        with self._cache_lock:
+            if request_id in self._kv_cache_by_request:
+                self._kv_cache_by_request.move_to_end(request_id)
+            elif len(self._kv_cache_by_request) >= self.max_cached_requests:
+                evicted_id, _ = self._kv_cache_by_request.popitem(last=False)
+                log.warning(f"Evicted KV cache for request {evicted_id} (LRU)")
 
-        self._kv_cache_by_request[request_id] = CacheEntry(
-            past_key_values=past_key_values,
-            tokens_seen=tokens_seen,
-            last_access_ts=time.time(),
-        )
+            self._kv_cache_by_request[request_id] = CacheEntry(
+                past_key_values=past_key_values,
+                tokens_seen=tokens_seen,
+                last_access_ts=time.time(),
+            )
 
     @staticmethod
     def _renumber_layer_indices(layers: nn.ModuleList) -> None:
@@ -428,11 +562,13 @@ class ShardExecutor:
 
     def clear_request_cache(self, request_id: str) -> None:
         """Clear KV cache for a specific request."""
-        self._kv_cache_by_request.pop(request_id, None)
+        with self._cache_lock:
+            self._kv_cache_by_request.pop(request_id, None)
 
     def clear_all_cache(self) -> None:
         """Clear KV cache for all requests."""
-        self._kv_cache_by_request.clear()
+        with self._cache_lock:
+            self._kv_cache_by_request.clear()
 
     def unload(self) -> None:
         """Unload the current model shard and free memory."""
@@ -448,6 +584,8 @@ class ShardExecutor:
 
     def get_layer_info(self) -> dict:
         """Get information about the currently loaded shard."""
+        with self._cache_lock:
+            cached_requests = len(self._kv_cache_by_request)
         return {
             "start_layer": self.start_layer,
             "end_layer": self.end_layer,
@@ -456,5 +594,5 @@ class ShardExecutor:
             "has_lm_head": self.has_lm_head,
             "loaded": self._loaded,
             "device": str(self.device),
-            "cached_requests": len(self._kv_cache_by_request),
+            "cached_requests": cached_requests,
         }

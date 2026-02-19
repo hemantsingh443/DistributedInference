@@ -195,6 +195,37 @@ class ActivationRouter:
                     f"{e.code()} - {e.details()}"
                 )
 
+    def cancel_request_on_pipeline(
+        self,
+        execution_plan: ExecutionPlan,
+        request_id: str,
+    ) -> None:
+        """Request cancellation for an active request across all pipeline stages."""
+        for stage in execution_plan.stages:
+            try:
+                stub = self._get_stub(stage.address)
+                if hasattr(stub, "CancelRequest"):
+                    stub.CancelRequest(
+                        inference_pb2.CacheControl(
+                            request_id=request_id,
+                            clear_all=False,
+                        ),
+                        timeout=10,
+                    )
+                else:
+                    stub.ClearRequestCache(
+                        inference_pb2.CacheControl(
+                            request_id=request_id,
+                            clear_all=False,
+                        ),
+                        timeout=10,
+                    )
+            except grpc.RpcError as e:
+                log.warning(
+                    f"Failed to cancel request on {stage.node_id}: "
+                    f"{e.code()} - {e.details()}"
+                )
+
     def load_shard_on_node(
         self,
         address: str,

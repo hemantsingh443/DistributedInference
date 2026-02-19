@@ -133,6 +133,23 @@ class TestNodeRegistry:
         node = registry.get_node("node-1")
         assert node.state == NodeState.READY
 
+    def test_dead_recovery_on_heartbeat(self, registry):
+        """Heartbeat should recover nodes marked dead by timeout races."""
+        registry.register("node-1", "localhost:50051", 2048)
+        registry.mark_dead("node-1")
+        assert registry.get_node("node-1").state == NodeState.DEAD
+
+        registry.update_heartbeat("node-1")
+        node = registry.get_node("node-1")
+        assert node.state == NodeState.READY
+
+    def test_missed_heartbeat_counter_increments_once_per_tick(self, registry):
+        """Miss counter should not be double-incremented by suspect transitions."""
+        registry.register("node-1", "localhost:50051", 2048)
+        assert registry.increment_missed_heartbeats("node-1") == 1
+        registry.mark_suspect("node-1")
+        assert registry.get_node("node-1").missed_heartbeats == 1
+
     def test_set_node_assignment(self, registry):
         """Test setting layer assignments."""
         registry.register("node-1", "localhost:50051", 2048)

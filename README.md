@@ -130,6 +130,9 @@ model:
 coordinator:
   port: 50050
   heartbeat_interval_sec: 5.0
+  max_concurrent_requests_global: 4
+  max_queue_size: 32
+  node_load_failure_backoff_sec: 30.0
   min_vram_mb: 512
   min_compute_tflops: 0.5
   gpu_required: false
@@ -142,10 +145,16 @@ inference:
   enable_kv_cache: true
 
 node:
-  max_cached_requests: 1
+  max_cached_requests: 8
+  max_concurrent_lanes: 4
   max_cache_tokens_per_request: 4096
   cache_eviction_policy: "lru"
 ```
+
+### Request Cancellation
+
+- gRPC API: `CoordinatorService.CancelInference(request_id, reason)`
+- Web API: `POST /api/runs/{request_id}/cancel`
 
 ### KV Cache Performance Expectations
 

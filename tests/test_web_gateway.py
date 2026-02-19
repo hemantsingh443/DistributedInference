@@ -57,6 +57,13 @@ class _FakeStub:
             ),
         )
 
+    def CancelInference(self, request, timeout=None):
+        del timeout
+        return inference_pb2.CancelInferenceResponse(
+            accepted=True,
+            status=f"cancelled {request.request_id}",
+        )
+
 
 class _FakeProcess:
     _pid_counter = 9999
@@ -119,6 +126,31 @@ def test_sse_stream_and_run_log_capture(monkeypatch):
     assert payload["events"][-1]["type"] == "completed"
 
 
+def test_cancel_run_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        web_app_module.grpc,
+        "insecure_channel",
+        lambda *args, **kwargs: _DummyChannel(),
+    )
+    monkeypatch.setattr(
+        web_app_module.inference_pb2_grpc,
+        "CoordinatorServiceStub",
+        lambda channel: _FakeStub(),
+    )
+
+    app = web_app_module.create_app(default_coordinator="localhost:50050")
+    client = TestClient(app)
+    response = client.post(
+        "/api/runs/req-cancel/cancel",
+        json={"reason": "unit-test"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["request_id"] == "req-cancel"
+
+
 def test_dynamic_node_api_join_list_stop(monkeypatch):
     monkeypatch.setattr(web_app_module, "_is_port_available", lambda port: True)
     monkeypatch.setattr(
@@ -163,6 +195,38 @@ def test_dynamic_node_api_join_list_stop(monkeypatch):
 
     list_after = client.get("/api/nodes").json()["nodes"]
     assert list_after == []
+
+
+def test_remove_exited_managed_node(monkeypatch):
+    monkeypatch.setattr(web_app_module, "_is_port_available", lambda port: True)
+    monkeypatch.setattr(
+        web_app_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            logs="Registered successfully: Node web-node-x registered successfully\n"
+        ),
+    )
+
+    app = web_app_module.create_app(default_coordinator="localhost:50050")
+    client = TestClient(app)
+
+    join_resp = client.post(
+        "/api/nodes/join",
+        json={"node_id": "web-node-x", "port": 50063, "device": "cpu"},
+    )
+    assert join_resp.status_code == 200
+
+    with app.state.managed_nodes_lock:
+        app.state.managed_nodes["web-node-x"].process._exit_code = 0
+
+    listed = client.get("/api/nodes").json()["nodes"]
+    assert len(listed) == 1
+    assert listed[0]["running"] is False
+
+    remove_resp = client.post("/api/nodes/web-node-x/remove")
+    assert remove_resp.status_code == 200
+    assert remove_resp.json()["success"] is True
+    assert client.get("/api/nodes").json()["nodes"] == []
 
 
 def test_dynamic_node_join_rejection_surfaces_error(monkeypatch):

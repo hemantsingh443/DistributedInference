@@ -40,7 +40,8 @@ class NodeAgent:
         max_vram_mb: Optional[int] = None,
         device: str = "auto",
         node_id: Optional[str] = None,
-        max_cached_requests: int = 1,
+        max_cached_requests: int = 8,
+        max_concurrent_lanes: int = 4,
         max_cache_tokens_per_request: int = 4096,
         bandwidth_mbps: Optional[float] = None,
         latency_ms: Optional[float] = None,
@@ -64,6 +65,7 @@ class NodeAgent:
             port=self.port,
             device_type=self.capabilities.device_type,
             max_cached_requests=max_cached_requests,
+            max_concurrent_lanes=max_concurrent_lanes,
             max_cache_tokens_per_request=max_cache_tokens_per_request,
         )
 
@@ -72,6 +74,10 @@ class NodeAgent:
         self._heartbeat_interval = 5.0
         self._require_registration_success = require_registration_success
         self._last_registration_error = ""
+        self._registered_with_coordinator = False
+        self._coord_lock = threading.RLock()
+        self._coord_channel: Optional[grpc.Channel] = None
+        self._coord_stub: Optional[inference_pb2_grpc.CoordinatorServiceStub] = None
 
     def start(self, block: bool = True) -> None:
         """Start the node agent.
@@ -121,7 +127,34 @@ class NodeAgent:
         log.info(f"Stopping node {self.node_id}")
         self._running = False
         self.server.stop(grace=5)
+        self._close_coordinator_channel()
         log.info(f"Node {self.node_id} stopped")
+
+    def _get_coordinator_stub(self) -> inference_pb2_grpc.CoordinatorServiceStub:
+        """Get or create a coordinator gRPC stub."""
+        with self._coord_lock:
+            if self._coord_stub is not None:
+                return self._coord_stub
+            options = [
+                ("grpc.max_send_message_length", 256 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+            ]
+            self._coord_channel = grpc.insecure_channel(
+                self.coordinator_address, options=options
+            )
+            self._coord_stub = inference_pb2_grpc.CoordinatorServiceStub(
+                self._coord_channel
+            )
+            return self._coord_stub
+
+    def _close_coordinator_channel(self) -> None:
+        """Close and reset the coordinator channel/stub."""
+        with self._coord_lock:
+            channel = self._coord_channel
+            self._coord_stub = None
+            self._coord_channel = None
+        if channel is not None:
+            channel.close()
 
     def _register_with_coordinator(self) -> bool:
         """Register this node with the coordinator.
@@ -132,14 +165,7 @@ class NodeAgent:
         log.info(f"Registering with coordinator at {self.coordinator_address}")
 
         try:
-            options = [
-                ("grpc.max_send_message_length", 256 * 1024 * 1024),
-                ("grpc.max_receive_message_length", 256 * 1024 * 1024),
-            ]
-            channel = grpc.insecure_channel(
-                self.coordinator_address, options=options
-            )
-            stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
+            stub = self._get_coordinator_stub()
 
             node_info = inference_pb2.NodeInfo(
                 node_id=self.node_id,
@@ -162,6 +188,7 @@ class NodeAgent:
                     f"{response.message}"
                 )
                 self._last_registration_error = ""
+                self._registered_with_coordinator = True
                 return True
             else:
                 rejection = (
@@ -170,10 +197,13 @@ class NodeAgent:
                 )
                 self._last_registration_error = f"{response.message}{rejection}"
                 log.error(f"Registration failed: {self._last_registration_error}")
+                self._registered_with_coordinator = False
                 return False
 
         except grpc.RpcError as e:
             self._last_registration_error = f"{e.code().name}: {e.details()}"
+            self._registered_with_coordinator = False
+            self._close_coordinator_channel()
             log.warning(
                 f"Could not reach coordinator: {e.code()} - {e.details()}"
             )
@@ -184,7 +214,10 @@ class NodeAgent:
         """Background thread sending periodic heartbeats to coordinator."""
         while self._running:
             try:
-                self._send_heartbeat()
+                if not self._registered_with_coordinator:
+                    self._register_with_coordinator()
+                else:
+                    self._send_heartbeat()
             except Exception as e:
                 log.warning(f"Heartbeat failed: {e}")
 
@@ -192,27 +225,22 @@ class NodeAgent:
 
     def _send_heartbeat(self) -> None:
         """Send a single heartbeat to the coordinator."""
+        stub = self._get_coordinator_stub()
+        from distributed_inference.node.resources import get_vram_usage_mb
+
+        status = inference_pb2.NodeStatus(
+            node_id=self.node_id,
+            status=inference_pb2.NodeStatus.READY,
+            vram_used_mb=get_vram_usage_mb(),
+            vram_total_mb=self.capabilities.vram_mb,
+            timestamp_ms=int(time.time() * 1000),
+        )
+
         try:
-            options = [
-                ("grpc.max_send_message_length", 256 * 1024 * 1024),
-                ("grpc.max_receive_message_length", 256 * 1024 * 1024),
-            ]
-            channel = grpc.insecure_channel(
-                self.coordinator_address, options=options
-            )
-            stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
-
-            from distributed_inference.node.resources import get_vram_usage_mb
-
-            status = inference_pb2.NodeStatus(
-                node_id=self.node_id,
-                status=inference_pb2.NodeStatus.READY,
-                vram_used_mb=get_vram_usage_mb(),
-                vram_total_mb=self.capabilities.vram_mb,
-                timestamp_ms=int(time.time() * 1000),
-            )
-
             stub.ReportHealth(status, timeout=5)
-
-        except grpc.RpcError:
-            pass  # Coordinator may not be available yet
+        except grpc.RpcError as e:
+            self._registered_with_coordinator = False
+            self._close_coordinator_channel()
+            raise RuntimeError(
+                f"{e.code().name}: {e.details()}"
+            ) from e

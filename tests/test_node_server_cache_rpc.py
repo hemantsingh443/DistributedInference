@@ -57,3 +57,46 @@ def test_clear_request_cache_rpc_dispatch():
 
     assert calls["clear_one"] == ["abc"]
     assert calls["clear_all"] == 1
+
+
+def test_cancel_request_rpc_marks_request_and_blocks_forward():
+    class DummyContext:
+        def __init__(self):
+            self.code = None
+            self.details = ""
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    servicer = NodeServiceImpl(node_id="node-3", device_type="cpu")
+    calls = {"forward": 0}
+
+    def fake_forward(**kwargs):
+        del kwargs
+        calls["forward"] += 1
+        return torch.randn(1, 1, 4)
+
+    servicer.executor.forward = fake_forward
+    hidden = torch.tensor([[1]], dtype=torch.long)
+    req = inference_pb2.ActivationData(
+        hidden_states=inference_pb2.TensorData(
+            data=serialize_tensor(hidden),
+            shape=list(hidden.shape),
+            dtype="int64",
+        ),
+        request_id="cancel-me",
+    )
+
+    _ = servicer.CancelRequest(
+        inference_pb2.CacheControl(request_id="cancel-me", clear_all=False),
+        context=None,
+    )
+
+    ctx = DummyContext()
+    response = servicer.RunForward(req, context=ctx)
+    assert response.hidden_states.data == b""
+    assert calls["forward"] == 0
+    assert "cancelled" in ctx.details

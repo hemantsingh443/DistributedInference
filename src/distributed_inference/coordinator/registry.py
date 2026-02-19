@@ -49,6 +49,9 @@ class RegisteredNode:
     last_heartbeat: float = 0.0
     missed_heartbeats: int = 0
     vram_used_mb: int = 0
+    active_requests: int = 0
+    queue_depth: int = 0
+    estimated_free_vram_mb: int = 0
     registered_at: float = field(default_factory=time.time)
 
 
@@ -166,7 +169,14 @@ class NodeRegistry:
                 if n.admitted and n.state not in (NodeState.DEAD, NodeState.SUSPECT)
             ]
 
-    def update_heartbeat(self, node_id: str, vram_used_mb: int = 0) -> None:
+    def update_heartbeat(
+        self,
+        node_id: str,
+        vram_used_mb: int = 0,
+        active_requests: int = 0,
+        queue_depth: int = 0,
+        estimated_free_vram_mb: int = 0,
+    ) -> None:
         """Update the last heartbeat timestamp for a node."""
         with self._lock:
             node = self._nodes.get(node_id)
@@ -174,16 +184,32 @@ class NodeRegistry:
                 node.last_heartbeat = time.time()
                 node.missed_heartbeats = 0
                 node.vram_used_mb = vram_used_mb
-                if node.state == NodeState.SUSPECT:
+                node.active_requests = active_requests
+                node.queue_depth = queue_depth
+                node.estimated_free_vram_mb = estimated_free_vram_mb
+                if node.state in (NodeState.SUSPECT, NodeState.DEAD):
+                    previous_state = node.state
                     node.state = NodeState.READY
-                    log.info(f"Node {node_id} recovered from suspect state")
+                    log.info(
+                        f"Node {node_id} recovered from {previous_state.value} state"
+                    )
+
+    def increment_missed_heartbeats(self, node_id: str) -> int:
+        """Increment heartbeat miss counter and return the updated value."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                return 0
+            if node.state == NodeState.DEAD:
+                return node.missed_heartbeats
+            node.missed_heartbeats += 1
+            return node.missed_heartbeats
 
     def mark_suspect(self, node_id: str) -> None:
         """Mark a node as suspect (missing heartbeats)."""
         with self._lock:
             node = self._nodes.get(node_id)
             if node and node.state not in (NodeState.DEAD,):
-                node.missed_heartbeats += 1
                 node.state = NodeState.SUSPECT
                 log.warning(
                     f"Node {node_id} marked SUSPECT "

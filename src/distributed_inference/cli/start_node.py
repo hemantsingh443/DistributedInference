@@ -33,8 +33,12 @@ def main():
         help="Custom node ID (default: auto-generated)"
     )
     parser.add_argument(
-        "--max-cached-requests", type=int, default=1,
-        help="Maximum concurrent request KV caches per node (default: 1)"
+        "--max-cached-requests", type=int, default=8,
+        help="Maximum concurrent request KV caches per node (default: 8)"
+    )
+    parser.add_argument(
+        "--max-concurrent-lanes", type=int, default=4,
+        help="Maximum concurrent forward lanes per node (default: 4)"
     )
     parser.add_argument(
         "--max-cache-tokens", type=int, default=4096,
@@ -69,6 +73,7 @@ def main():
         device=args.device,
         node_id=args.node_id,
         max_cached_requests=args.max_cached_requests,
+        max_concurrent_lanes=args.max_concurrent_lanes,
         max_cache_tokens_per_request=args.max_cache_tokens,
         bandwidth_mbps=args.bandwidth_mbps,
         latency_ms=args.latency_ms,

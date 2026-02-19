@@ -56,6 +56,9 @@ message NodeStatus {
   repeated int32 assigned_layers = 5;
   float load_percent = 6;
   int64 timestamp_ms = 7;
+  int32 active_requests = 8;
+  int32 queue_depth = 9;
+  int64 estimated_free_vram_mb = 10;
 }
 
 // Shard assignment from coordinator to node
@@ -101,6 +104,16 @@ message InferenceResponse {
   float total_latency_ms = 4;
   repeated float per_hop_latency_ms = 5;
   float tokens_per_second = 6;
+}
+
+message CancelInferenceRequest {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message CancelInferenceResponse {
+  bool accepted = 1;
+  string status = 2;
 }
 
 // Per-hop telemetry event emitted during streaming inference.
@@ -165,6 +178,9 @@ service NodeService {
 
   // Clear cache state for a specific request or all requests.
   rpc ClearRequestCache(CacheControl) returns (Empty);
+
+  // Cancel an in-flight request on this node.
+  rpc CancelRequest(CacheControl) returns (Empty);
 }
 
 // ============================================================
@@ -182,4 +198,7 @@ service CoordinatorService {
 
   // Client submits an inference request and receives streaming events.
   rpc SubmitInferenceStream(InferenceRequest) returns (stream InferenceEvent);
+
+  // Client requests cancellation of an in-flight inference request.
+  rpc CancelInference(CancelInferenceRequest) returns (CancelInferenceResponse);
 }

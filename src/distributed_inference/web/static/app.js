@@ -121,16 +121,15 @@
         ? `: ${node.registration_message}`
         : "";
       const statusText = `${runtimeStatus}, ${registration}${registrationMsg}`;
+      const actionBtn = node.running
+        ? `<button class="secondary stop-node-btn" data-node-id="${node.node_id}">Stop</button>`
+        : `<button class="secondary remove-node-btn" data-node-id="${node.node_id}">Remove</button>`;
       row.innerHTML = `
         <td>${node.node_id}</td>
         <td>${node.port}</td>
         <td>${node.pid}</td>
         <td>${statusText}</td>
-        <td>
-          <button class="secondary stop-node-btn" data-node-id="${node.node_id}" ${
-            node.running ? "" : "disabled"
-          }>Stop</button>
-        </td>
+        <td>${actionBtn}</td>
       `;
       nodesBody.appendChild(row);
     }
@@ -193,6 +192,23 @@
       await fetchNodes();
     } catch (err) {
       setNodeStatus(`Stop failed: ${err.message || err}`);
+    }
+  };
+
+  const removeNode = async (nodeId) => {
+    setNodeStatus(`Removing ${nodeId}...`);
+    try {
+      const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/remove`, {
+        method: "POST",
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.detail || "remove failed");
+      }
+      setNodeStatus(`Removed ${nodeId}`);
+      await fetchNodes();
+    } catch (err) {
+      setNodeStatus(`Remove failed: ${err.message || err}`);
     }
   };
 
@@ -264,15 +280,20 @@
       if (!(target instanceof HTMLElement)) {
         return;
       }
-      if (!target.classList.contains("stop-node-btn")) {
-        return;
-      }
       const nodeId = target.getAttribute("data-node-id");
       if (!nodeId) {
         return;
       }
+      if (!target.classList.contains("stop-node-btn") &&
+          !target.classList.contains("remove-node-btn")) {
+        return;
+      }
       target.setAttribute("disabled", "true");
-      await stopNode(nodeId);
+      if (target.classList.contains("stop-node-btn")) {
+        await stopNode(nodeId);
+      } else {
+        await removeNode(nodeId);
+      }
     });
   }
 

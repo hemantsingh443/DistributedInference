@@ -59,6 +59,13 @@ class JoinNodeRequest(BaseModel):
     log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR)$")
 
 
+class CancelRunRequest(BaseModel):
+    """Payload for cancelling an active run."""
+
+    coordinator: str | None = None
+    reason: str = "cancelled by user"
+
+
 class RunLogStore:
     """In-memory request-scoped event store with a fixed per-run cap."""
 
@@ -323,6 +330,38 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="request_id not found")
         return JSONResponse({"request_id": request_id, "events": events})
 
+    @app.post("/api/runs/{request_id}/cancel")
+    def cancel_run(request_id: str, payload: CancelRunRequest, request: Request):
+        coordinator_addr = payload.coordinator or request.app.state.default_coordinator
+        options = [
+            ("grpc.max_send_message_length", 256 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+        ]
+        channel = grpc.insecure_channel(coordinator_addr, options=options)
+        stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
+        try:
+            response = stub.CancelInference(
+                inference_pb2.CancelInferenceRequest(
+                    request_id=request_id,
+                    reason=payload.reason,
+                ),
+                timeout=10,
+            )
+            return JSONResponse(
+                {
+                    "request_id": request_id,
+                    "accepted": bool(response.accepted),
+                    "status": response.status,
+                }
+            )
+        except grpc.RpcError as rpc_error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{rpc_error.code().name}: {rpc_error.details()}",
+            ) from rpc_error
+        finally:
+            channel.close()
+
     @app.get("/api/nodes")
     def list_managed_nodes(request: Request):
         """List node processes launched via web controls."""
@@ -490,6 +529,25 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
                 "exit_code": process.poll(),
             }
         )
+
+    @app.post("/api/nodes/{node_id}/remove")
+    def remove_node(request: Request, node_id: str):
+        """Remove a non-running managed node entry from the web registry."""
+        with request.app.state.managed_nodes_lock:
+            managed = request.app.state.managed_nodes.get(node_id)
+            if not managed:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Managed node '{node_id}' not found",
+                )
+            if managed.process.poll() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Managed node '{node_id}' is still running; stop it first",
+                )
+            request.app.state.managed_nodes.pop(node_id, None)
+
+        return JSONResponse({"success": True, "node_id": node_id})
 
     @app.get("/api/stream")
     def stream_inference(

@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from concurrent import futures
+from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 import grpc
@@ -37,6 +38,20 @@ class NodeLoadError(RuntimeError):
     def __init__(self, node_id: str, message: str):
         super().__init__(message)
         self.node_id = node_id
+
+
+class RequestCancelledError(RuntimeError):
+    """Raised when an in-flight request is cancelled."""
+
+
+@dataclass
+class RequestContext:
+    """Tracks mutable lifecycle state for a single inference request."""
+    request_id: str
+    created_at: float = field(default_factory=time.time)
+    queue_wait_ms: float = 0.0
+    cancel_reason: str = ""
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
@@ -95,9 +110,18 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
 
     def ReportHealth(self, request, context):
         """Handle health reports from nodes."""
+        if self.orchestrator.registry.get_node(request.node_id) is None:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(
+                f"Node {request.node_id} is not registered; re-register required"
+            )
+            return inference_pb2.Empty()
         self.orchestrator.registry.update_heartbeat(
             node_id=request.node_id,
             vram_used_mb=request.vram_used_mb,
+            active_requests=request.active_requests,
+            queue_depth=request.queue_depth,
+            estimated_free_vram_mb=request.estimated_free_vram_mb,
         )
         return inference_pb2.Empty()
 
@@ -120,9 +144,22 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             )
             return result
 
+        except RequestCancelledError as e:
+            context.set_code(grpc.StatusCode.CANCELLED)
+            context.set_details(str(e))
+            return inference_pb2.InferenceResponse(
+                request_id=request.request_id,
+                generated_text=f"CANCELLED: {e}",
+            )
         except Exception as e:
             log.error(f"Inference failed: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
+            message = str(e)
+            if "overloaded" in message or "queue full" in message:
+                context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+            elif "rebalancing" in message:
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+            else:
+                context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return inference_pb2.InferenceResponse(
                 request_id=request.request_id,
@@ -148,7 +185,19 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 top_k=request.top_k or 50,
                 request_id=request_id,
             ):
+                if not context.is_active():
+                    self.orchestrator.cancel_inference(
+                        request_id=request_id,
+                        reason="client disconnected",
+                    )
+                    break
                 yield event
+        except RequestCancelledError as e:
+            yield inference_pb2.InferenceEvent(
+                request_id=request_id,
+                timestamp_ms=int(time.time() * 1000),
+                error=str(e),
+            )
         except Exception as e:
             log.error(f"Streaming inference failed: {e}")
             yield inference_pb2.InferenceEvent(
@@ -156,6 +205,22 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 timestamp_ms=int(time.time() * 1000),
                 error=str(e),
             )
+
+    def CancelInference(self, request, context):
+        """Handle explicit client cancellation of an active request."""
+        cancelled = self.orchestrator.cancel_inference(
+            request_id=request.request_id,
+            reason=request.reason or "cancelled by client",
+        )
+        if not cancelled:
+            return inference_pb2.CancelInferenceResponse(
+                accepted=False,
+                status="request not found or already finished",
+            )
+        return inference_pb2.CancelInferenceResponse(
+            accepted=True,
+            status="cancellation requested",
+        )
 
 
 class Orchestrator:
@@ -184,11 +249,30 @@ class Orchestrator:
         self._model_loaded = False
         self._health_thread: Optional[threading.Thread] = None
         self._state_lock = threading.RLock()
+        self._request_cond = threading.Condition(self._state_lock)
         self._active_requests = 0
+        self._queued_requests = 0
         self._accepting_requests = True
+        self._request_contexts: dict[str, RequestContext] = {}
+        self._contexts_lock = threading.RLock()
+        self._max_concurrent_requests = max(
+            1,
+            int(
+                getattr(
+                    self.config.coordinator,
+                    "max_concurrent_requests_global",
+                    self.config.coordinator.max_concurrent_requests,
+                )
+            ),
+        )
+        self._max_queue_size = max(
+            0,
+            int(getattr(self.config.coordinator, "max_queue_size", 32)),
+        )
         self._plan_version = 0
         self._last_rebalance_reason = ""
         self._rebalance_lock = threading.RLock()
+        self._node_load_backoff_until: dict[str, float] = {}
         self._rebalance_controller = RebalanceController(
             callback=self._rebalance_pipeline,
             cooldown_sec=self.config.coordinator.rebalance_cooldown_sec,
@@ -375,7 +459,7 @@ class Orchestrator:
                         break
                     except NodeLoadError as e:
                         last_error = e
-                        self.registry.mark_dead(e.node_id)
+                        self._handle_node_load_error(e)
                         log.warning(
                             f"Rebalance attempt {attempt} failed at node {e.node_id}: {e}. "
                             "Retrying with remaining healthy nodes."
@@ -425,8 +509,12 @@ class Orchestrator:
 
     def _get_rebalance_candidate_nodes(self):
         """Return admitted nodes currently reachable for shard placement."""
+        now = time.time()
         candidates = []
         for node in self.registry.get_admitted_active_nodes():
+            backoff_until = self._node_load_backoff_until.get(node.node_id, 0.0)
+            if backoff_until > now:
+                continue
             health = self.router.check_node_health(node.address)
             if health is None:
                 self.registry.mark_suspect(node.node_id)
@@ -435,8 +523,35 @@ class Orchestrator:
                     f"{node.node_id} @ {node.address}"
                 )
                 continue
+            if node.node_id in self._node_load_backoff_until:
+                self._node_load_backoff_until.pop(node.node_id, None)
             candidates.append(node)
         return candidates
+
+    def _handle_node_load_error(self, error: NodeLoadError) -> None:
+        """Apply failure policy for shard-load errors without over-flapping node liveness."""
+        message = str(error).lower()
+
+        # Transport/liveness failures should mark node dead.
+        if (
+            "unreachable" in message
+            or "failed to connect" in message
+            or "connection refused" in message
+            or "connection reset" in message
+        ):
+            self.registry.mark_dead(error.node_id)
+            return
+
+        # Resource/runtime load failures are treated as temporary capacity issues.
+        backoff_sec = float(
+            getattr(self.config.coordinator, "node_load_failure_backoff_sec", 30.0)
+        )
+        self._node_load_backoff_until[error.node_id] = time.time() + max(backoff_sec, 1.0)
+        self.registry.set_node_state(error.node_id, NodeState.IDLE)
+        log.warning(
+            f"Temporarily excluding node {error.node_id} from load attempts for "
+            f"{backoff_sec:.0f}s after shard-load failure"
+        )
 
     def _is_plan_viable(self, plan: PartitionPlan) -> bool:
         """Check whether a plan only references currently live/reachable nodes."""
@@ -462,6 +577,15 @@ class Orchestrator:
             node = self.registry.get_node(assignment.node_id)
             if not node:
                 raise RuntimeError(f"Node {assignment.node_id} not found")
+
+            assignment_unchanged = (
+                node.assigned_layers == (assignment.start_layer, assignment.end_layer)
+                and node.has_embedding == assignment.has_embedding
+                and node.has_lm_head == assignment.has_lm_head
+                and node.state in (NodeState.READY, NodeState.BUSY)
+            )
+            if assignment_unchanged:
+                continue
 
             self.registry.set_node_state(node.node_id, NodeState.LOADING)
             if self.router.check_node_health(node.address) is None:
@@ -524,10 +648,12 @@ class Orchestrator:
     def _begin_drain(self) -> None:
         with self._state_lock:
             self._accepting_requests = False
+            self._request_cond.notify_all()
 
     def _end_drain(self) -> None:
         with self._state_lock:
             self._accepting_requests = True
+            self._request_cond.notify_all()
 
     def _wait_for_drain(self, timeout_sec: float) -> bool:
         deadline = time.time() + timeout_sec
@@ -539,15 +665,102 @@ class Orchestrator:
         with self._state_lock:
             return self._active_requests == 0
 
-    def _enter_request(self) -> None:
+    def _enter_request(self, request_id: str) -> float:
+        wait_start = time.time()
         with self._state_lock:
             if not self._accepting_requests:
                 raise RuntimeError("Coordinator is rebalancing; retry shortly")
+
+            if self._active_requests >= self._max_concurrent_requests:
+                if self._queued_requests >= self._max_queue_size:
+                    raise RuntimeError(
+                        "Coordinator overloaded: queue full, retry shortly"
+                    )
+
+                self._queued_requests += 1
+                try:
+                    while self._active_requests >= self._max_concurrent_requests:
+                        if not self._accepting_requests:
+                            raise RuntimeError(
+                                "Coordinator is rebalancing; retry shortly"
+                            )
+                        self._request_cond.wait(timeout=0.1)
+                finally:
+                    self._queued_requests = max(self._queued_requests - 1, 0)
+
             self._active_requests += 1
+        wait_ms = (time.time() - wait_start) * 1000
+        if wait_ms > 1.0:
+            log.info(
+                f"Request {request_id} dequeued after waiting {wait_ms:.1f}ms"
+            )
+        return wait_ms
 
     def _exit_request(self) -> None:
         with self._state_lock:
             self._active_requests = max(self._active_requests - 1, 0)
+            self._request_cond.notify_all()
+
+    def _register_request_context(self, request_id: str) -> RequestContext:
+        with self._contexts_lock:
+            if request_id in self._request_contexts:
+                raise RuntimeError(
+                    f"request_id '{request_id}' is already active"
+                )
+            context = RequestContext(request_id=request_id)
+            self._request_contexts[request_id] = context
+            return context
+
+    def _get_request_context(self, request_id: str) -> Optional[RequestContext]:
+        with self._contexts_lock:
+            return self._request_contexts.get(request_id)
+
+    def _unregister_request_context(self, request_id: str) -> None:
+        with self._contexts_lock:
+            self._request_contexts.pop(request_id, None)
+
+    def _assert_not_cancelled(
+        self,
+        request_context: RequestContext,
+        execution_plan: Optional[ExecutionPlan] = None,
+    ) -> None:
+        if not request_context.cancel_event.is_set():
+            return
+        if execution_plan:
+            try:
+                self.router.cancel_request_on_pipeline(
+                    execution_plan=execution_plan,
+                    request_id=request_context.request_id,
+                )
+            except Exception as e:
+                log.warning(
+                    f"Failed to propagate cancellation for "
+                    f"{request_context.request_id}: {e}"
+                )
+        reason = request_context.cancel_reason or "cancelled"
+        raise RequestCancelledError(
+            f"request {request_context.request_id} cancelled: {reason}"
+        )
+
+    def cancel_inference(self, request_id: str, reason: str = "cancelled") -> bool:
+        """Request cancellation for an active inference context."""
+        context = self._get_request_context(request_id)
+        if context is None:
+            return False
+        context.cancel_reason = reason
+        context.cancel_event.set()
+
+        with self._state_lock:
+            execution_plan = self._execution_plan
+        if execution_plan:
+            try:
+                self.router.cancel_request_on_pipeline(
+                    execution_plan=execution_plan,
+                    request_id=request_id,
+                )
+            except Exception as e:
+                log.warning(f"Best-effort cancel propagation failed: {e}")
+        return True
 
     def run_inference(
         self,
@@ -573,6 +786,8 @@ class Orchestrator:
             if event.WhichOneof("payload") == "completed":
                 completed = event.completed
             elif event.WhichOneof("payload") == "error":
+                if "cancelled" in event.error.lower():
+                    raise RequestCancelledError(event.error)
                 raise RuntimeError(event.error)
 
         if completed is None:
@@ -589,8 +804,16 @@ class Orchestrator:
         request_id: str = "",
     ) -> Iterator[inference_pb2.InferenceEvent]:
         """Run inference and yield streaming hop/token/completion events."""
-        self._enter_request()
+        request_id = request_id or uuid.uuid4().hex[:8]
+        request_context = self._register_request_context(request_id)
+        entered = False
+        execution_plan: Optional[ExecutionPlan] = None
+        use_kv_cache = False
+
         try:
+            request_context.queue_wait_ms = self._enter_request(request_id)
+            entered = True
+
             if not self.is_ready:
                 raise RuntimeError("Model not set up. Call setup_model() first.")
             with self._state_lock:
@@ -599,7 +822,6 @@ class Orchestrator:
                 raise RuntimeError("No execution plan available")
 
             start_time = time.time()
-            request_id = request_id or uuid.uuid4().hex[:8]
             use_kv_cache = bool(
                 getattr(self.config.inference, "enable_kv_cache", False)
             )
@@ -610,6 +832,8 @@ class Orchestrator:
 
             all_hop_latencies = []
             generated_tokens = 0
+
+            self._assert_not_cancelled(request_context, execution_plan)
 
             if use_kv_cache:
                 logits = None
@@ -624,6 +848,7 @@ class Orchestrator:
                     cache_position=prefill_cache_pos,
                     is_prefill=True,
                 ):
+                    self._assert_not_cancelled(request_context, execution_plan)
                     logits = trace.output
                     all_hop_latencies.append(trace.hop_latency_ms)
                     yield inference_pb2.InferenceEvent(
@@ -644,6 +869,7 @@ class Orchestrator:
                     raise RuntimeError("No logits returned from prefill")
 
                 for step in range(max_tokens):
+                    self._assert_not_cancelled(request_context, execution_plan)
                     if step > 0:
                         decode_input = input_ids[:, -1:]
                         decode_cache_pos = int(input_ids.shape[1] - 1)
@@ -658,6 +884,9 @@ class Orchestrator:
                             cache_position=decode_cache_pos,
                             is_prefill=False,
                         ):
+                            self._assert_not_cancelled(
+                                request_context, execution_plan
+                            )
                             logits = trace.output
                             all_hop_latencies.append(trace.hop_latency_ms)
                             yield inference_pb2.InferenceEvent(
@@ -690,7 +919,10 @@ class Orchestrator:
                     input_ids = torch.cat([input_ids, next_token], dim=-1)
                     if attention_mask is not None:
                         attention_mask = torch.cat(
-                            [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
+                            [
+                                attention_mask,
+                                torch.ones(1, 1, dtype=attention_mask.dtype),
+                            ],
                             dim=-1,
                         )
 
@@ -715,6 +947,7 @@ class Orchestrator:
                     )
             else:
                 for step in range(max_tokens):
+                    self._assert_not_cancelled(request_context, execution_plan)
                     logits = None
                     for trace in self.router.route_forward_stream(
                         input_ids=input_ids,
@@ -726,6 +959,7 @@ class Orchestrator:
                         cache_position=None,
                         is_prefill=False,
                     ):
+                        self._assert_not_cancelled(request_context, execution_plan)
                         logits = trace.output
                         all_hop_latencies.append(trace.hop_latency_ms)
                         yield inference_pb2.InferenceEvent(
@@ -757,7 +991,10 @@ class Orchestrator:
                     input_ids = torch.cat([input_ids, next_token], dim=-1)
                     if attention_mask is not None:
                         attention_mask = torch.cat(
-                            [attention_mask, torch.ones(1, 1, dtype=attention_mask.dtype)],
+                            [
+                                attention_mask,
+                                torch.ones(1, 1, dtype=attention_mask.dtype),
+                            ],
                             dim=-1,
                         )
 
@@ -780,8 +1017,36 @@ class Orchestrator:
                             accumulated_text=accumulated_text,
                         ),
                     )
+
+            generated_text = self._tokenizer.decode(
+                input_ids[0], skip_special_tokens=True
+            )
+            total_time_ms = (time.time() - start_time) * 1000
+            tokens_per_sec = (
+                generated_tokens / (total_time_ms / 1000)
+                if total_time_ms > 0 else 0
+            )
+
+            log.info(
+                f"[bold green]Inference complete[/]: "
+                f"{generated_tokens} tokens in {total_time_ms:.0f}ms "
+                f"({tokens_per_sec:.1f} tok/s)"
+            )
+
+            yield inference_pb2.InferenceEvent(
+                request_id=request_id,
+                timestamp_ms=int(time.time() * 1000),
+                completed=inference_pb2.InferenceResponse(
+                    request_id=request_id,
+                    generated_text=generated_text,
+                    tokens_generated=generated_tokens,
+                    total_latency_ms=total_time_ms,
+                    per_hop_latency_ms=all_hop_latencies,
+                    tokens_per_second=tokens_per_sec,
+                ),
+            )
         finally:
-            if 'use_kv_cache' in locals() and use_kv_cache and execution_plan:
+            if use_kv_cache and execution_plan:
                 try:
                     self.router.clear_request_cache_on_pipeline(
                         execution_plan=execution_plan,
@@ -789,32 +1054,9 @@ class Orchestrator:
                     )
                 except Exception as e:
                     log.warning(f"Cache cleanup failed for {request_id}: {e}")
-            self._exit_request()
-
-        generated_text = self._tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        total_time_ms = (time.time() - start_time) * 1000
-        tokens_per_sec = (
-            generated_tokens / (total_time_ms / 1000) if total_time_ms > 0 else 0
-        )
-
-        log.info(
-            f"[bold green]Inference complete[/]: "
-            f"{generated_tokens} tokens in {total_time_ms:.0f}ms "
-            f"({tokens_per_sec:.1f} tok/s)"
-        )
-
-        yield inference_pb2.InferenceEvent(
-            request_id=request_id,
-            timestamp_ms=int(time.time() * 1000),
-            completed=inference_pb2.InferenceResponse(
-                request_id=request_id,
-                generated_text=generated_text,
-                tokens_generated=generated_tokens,
-                total_latency_ms=total_time_ms,
-                per_hop_latency_ms=all_hop_latencies,
-                tokens_per_second=tokens_per_sec,
-            ),
-        )
+            if entered:
+                self._exit_request()
+            self._unregister_request_context(request_id)
 
     @staticmethod
     def _sample_next_token(
@@ -874,12 +1116,12 @@ class Orchestrator:
 
                 elapsed = time.time() - node.last_heartbeat
                 if elapsed > timeout:
-                    node.missed_heartbeats += 1
-                    if node.missed_heartbeats >= threshold:
+                    missed = self.registry.increment_missed_heartbeats(node.node_id)
+                    if missed >= threshold:
                         self.registry.mark_dead(node.node_id)
                         log.error(
                             f"Node {node.node_id} declared DEAD "
-                            f"({node.missed_heartbeats} missed heartbeats)"
+                            f"({missed} missed heartbeats)"
                         )
                     else:
                         self.registry.mark_suspect(node.node_id)

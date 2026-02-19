@@ -16,12 +16,9 @@ except ImportError:
     _version_not_supported = True
 
 if _version_not_supported:
-    raise RuntimeError(
-        f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in inference_pb2_grpc.py depends on'
-        + f' grpcio>={GRPC_GENERATED_VERSION}.'
-        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
-        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
+    warnings.warn(
+        "grpcio version is older than generated stubs; proceeding with best effort",
+        RuntimeWarning,
     )
 
 
@@ -40,28 +37,27 @@ class NodeServiceStub(object):
         self.LoadModelShard = channel.unary_unary(
                 '/distributed_inference.NodeService/LoadModelShard',
                 request_serializer=inference__pb2.ShardAssignment.SerializeToString,
-                response_deserializer=inference__pb2.NodeStatus.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.NodeStatus.FromString)
         self.RunForward = channel.unary_unary(
                 '/distributed_inference.NodeService/RunForward',
                 request_serializer=inference__pb2.ActivationData.SerializeToString,
-                response_deserializer=inference__pb2.ActivationData.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.ActivationData.FromString)
         self.Heartbeat = channel.unary_unary(
                 '/distributed_inference.NodeService/Heartbeat',
                 request_serializer=inference__pb2.Empty.SerializeToString,
-                response_deserializer=inference__pb2.HeartbeatResponse.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.HeartbeatResponse.FromString)
         self.UnloadShard = channel.unary_unary(
                 '/distributed_inference.NodeService/UnloadShard',
                 request_serializer=inference__pb2.Empty.SerializeToString,
-                response_deserializer=inference__pb2.NodeStatus.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.NodeStatus.FromString)
         self.ClearRequestCache = channel.unary_unary(
                 '/distributed_inference.NodeService/ClearRequestCache',
                 request_serializer=inference__pb2.CacheControl.SerializeToString,
-                response_deserializer=inference__pb2.Empty.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.Empty.FromString)
+        self.CancelRequest = channel.unary_unary(
+                '/distributed_inference.NodeService/CancelRequest',
+                request_serializer=inference__pb2.CacheControl.SerializeToString,
+                response_deserializer=inference__pb2.Empty.FromString)
 
 
 class NodeServiceServicer(object):
@@ -105,6 +101,13 @@ class NodeServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelRequest(self, request, context):
+        """Cancel an in-flight request on this node.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NodeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -133,11 +136,20 @@ def add_NodeServiceServicer_to_server(servicer, server):
                     request_deserializer=inference__pb2.CacheControl.FromString,
                     response_serializer=inference__pb2.Empty.SerializeToString,
             ),
+            'CancelRequest': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelRequest,
+                    request_deserializer=inference__pb2.CacheControl.FromString,
+                    response_serializer=inference__pb2.Empty.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'distributed_inference.NodeService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('distributed_inference.NodeService', rpc_method_handlers)
+    if hasattr(server, "add_registered_method_handlers"):
+        server.add_registered_method_handlers(
+            'distributed_inference.NodeService',
+            rpc_method_handlers,
+        )
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -171,8 +183,7 @@ class NodeService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def RunForward(request,
@@ -198,8 +209,7 @@ class NodeService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def Heartbeat(request,
@@ -225,8 +235,7 @@ class NodeService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def UnloadShard(request,
@@ -252,8 +261,7 @@ class NodeService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def ClearRequestCache(request,
@@ -279,8 +287,33 @@ class NodeService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
+
+    @staticmethod
+    def CancelRequest(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distributed_inference.NodeService/CancelRequest',
+            inference__pb2.CacheControl.SerializeToString,
+            inference__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata)
 
 
 class CoordinatorServiceStub(object):
@@ -298,23 +331,23 @@ class CoordinatorServiceStub(object):
         self.RegisterNode = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/RegisterNode',
                 request_serializer=inference__pb2.NodeInfo.SerializeToString,
-                response_deserializer=inference__pb2.RegistrationAck.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.RegistrationAck.FromString)
         self.ReportHealth = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/ReportHealth',
                 request_serializer=inference__pb2.NodeStatus.SerializeToString,
-                response_deserializer=inference__pb2.Empty.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.Empty.FromString)
         self.SubmitInference = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/SubmitInference',
                 request_serializer=inference__pb2.InferenceRequest.SerializeToString,
-                response_deserializer=inference__pb2.InferenceResponse.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.InferenceResponse.FromString)
         self.SubmitInferenceStream = channel.unary_stream(
                 '/distributed_inference.CoordinatorService/SubmitInferenceStream',
                 request_serializer=inference__pb2.InferenceRequest.SerializeToString,
-                response_deserializer=inference__pb2.InferenceEvent.FromString,
-                _registered_method=True)
+                response_deserializer=inference__pb2.InferenceEvent.FromString)
+        self.CancelInference = channel.unary_unary(
+                '/distributed_inference.CoordinatorService/CancelInference',
+                request_serializer=inference__pb2.CancelInferenceRequest.SerializeToString,
+                response_deserializer=inference__pb2.CancelInferenceResponse.FromString)
 
 
 class CoordinatorServiceServicer(object):
@@ -351,6 +384,13 @@ class CoordinatorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CancelInference(self, request, context):
+        """Client requests cancellation of an in-flight inference request.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -374,11 +414,20 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     request_deserializer=inference__pb2.InferenceRequest.FromString,
                     response_serializer=inference__pb2.InferenceEvent.SerializeToString,
             ),
+            'CancelInference': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelInference,
+                    request_deserializer=inference__pb2.CancelInferenceRequest.FromString,
+                    response_serializer=inference__pb2.CancelInferenceResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'distributed_inference.CoordinatorService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('distributed_inference.CoordinatorService', rpc_method_handlers)
+    if hasattr(server, "add_registered_method_handlers"):
+        server.add_registered_method_handlers(
+            'distributed_inference.CoordinatorService',
+            rpc_method_handlers,
+        )
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -412,8 +461,7 @@ class CoordinatorService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def ReportHealth(request,
@@ -439,8 +487,7 @@ class CoordinatorService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def SubmitInference(request,
@@ -466,8 +513,7 @@ class CoordinatorService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
 
     @staticmethod
     def SubmitInferenceStream(request,
@@ -493,5 +539,30 @@ class CoordinatorService(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+            metadata)
+
+    @staticmethod
+    def CancelInference(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distributed_inference.CoordinatorService/CancelInference',
+            inference__pb2.CancelInferenceRequest.SerializeToString,
+            inference__pb2.CancelInferenceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata)

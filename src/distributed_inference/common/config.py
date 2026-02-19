@@ -33,10 +33,17 @@ class CoordinatorConfig:
     heartbeat_timeout_sec: float = 15.0
     failure_threshold: int = 3  # Missed heartbeats before marking dead
     max_concurrent_requests: int = 4
+    max_concurrent_requests_global: int = 4
+    max_queue_size: int = 32
+    scheduler_policy: str = "balanced"
+    fairness_quantum_tokens: int = 16
+    tail_latency_guardrail_ms: float = 2500.0
+    per_node_vram_safety_margin: float = 0.9
     min_vram_mb: int = 512
     min_compute_tflops: float = 0.5
     gpu_required: bool = False
     rebalance_cooldown_sec: float = 5.0
+    node_load_failure_backoff_sec: float = 30.0
     rebalance_drain_timeout_sec: float = 30.0
     allocation_alpha_latency: float = 0.7
     allocation_beta_throughput: float = 0.3
@@ -53,7 +60,10 @@ class NodeConfig:
     max_vram_mb: Optional[int] = None  # None = use all available
     device: str = "auto"  # "auto", "cuda", "cpu"
     coordinator_address: str = "localhost:50050"
-    max_cached_requests: int = 1
+    max_cached_requests: int = 8
+    max_concurrent_lanes: int = 4
+    warm_context_pool_size: int = 2
+    max_prefill_batch_size: int = 1
     max_cache_tokens_per_request: int = 4096
     cache_eviction_policy: str = "lru"
 

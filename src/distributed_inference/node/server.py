@@ -7,6 +7,7 @@ Implements the NodeService defined in inference.proto. Handles:
 """
 
 import time
+import threading
 from concurrent import futures
 
 import grpc
@@ -36,11 +37,15 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
         self,
         node_id: str,
         device_type: str = "cpu",
-        max_cached_requests: int = 1,
+        max_cached_requests: int = 8,
         max_cache_tokens_per_request: int = 4096,
+        max_concurrent_lanes: int = 4,
     ):
         self.node_id = node_id
         self.device_type = device_type
+        self.max_concurrent_lanes = max(1, int(max_concurrent_lanes))
+        if max_cached_requests < self.max_concurrent_lanes:
+            max_cached_requests = self.max_concurrent_lanes
         self.executor = ShardExecutor(
             device_type=device_type,
             max_cached_requests=max_cached_requests,
@@ -48,6 +53,41 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
         )
         self._status = inference_pb2.NodeStatus.IDLE
         self._vram_total_mb = 0
+        self._status_lock = threading.RLock()
+        self._lane_semaphore = threading.BoundedSemaphore(self.max_concurrent_lanes)
+        self._active_requests = 0
+        self._queue_depth = 0
+        self._cancelled_requests: set[str] = set()
+
+    def _set_status(self, status: int) -> None:
+        with self._status_lock:
+            self._status = status
+
+    def _get_status(self) -> int:
+        with self._status_lock:
+            return self._status
+
+    def _try_acquire_lane(self, timeout_sec: float = 30.0) -> bool:
+        with self._status_lock:
+            self._queue_depth += 1
+        acquired = self._lane_semaphore.acquire(timeout=timeout_sec)
+        with self._status_lock:
+            self._queue_depth = max(self._queue_depth - 1, 0)
+            if acquired:
+                self._active_requests += 1
+                self._status = inference_pb2.NodeStatus.BUSY
+        return acquired
+
+    def _release_lane(self) -> None:
+        with self._status_lock:
+            self._active_requests = max(self._active_requests - 1, 0)
+            if self._active_requests == 0:
+                self._status = (
+                    inference_pb2.NodeStatus.READY
+                    if self.executor.loaded
+                    else inference_pb2.NodeStatus.IDLE
+                )
+        self._lane_semaphore.release()
 
     def LoadModelShard(self, request, context):
         """Load model shard as instructed by the coordinator."""
@@ -58,7 +98,7 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
             f"embed={request.has_embedding}, lm_head={request.has_lm_head}"
         )
 
-        self._status = inference_pb2.NodeStatus.LOADING
+        self._set_status(inference_pb2.NodeStatus.LOADING)
 
         try:
             stats = self.executor.load_shard(
@@ -69,14 +109,14 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 has_lm_head=request.has_lm_head,
                 dtype=request.dtype or "float16",
             )
-            self._status = inference_pb2.NodeStatus.READY
+            self._set_status(inference_pb2.NodeStatus.READY)
             self._vram_total_mb = stats.get("vram_used_mb", 0)
 
             return self._build_status()
 
         except Exception as e:
             log.error(f"Failed to load shard: {e}")
-            self._status = inference_pb2.NodeStatus.ERROR
+            self._set_status(inference_pb2.NodeStatus.ERROR)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return self._build_status()
@@ -84,7 +124,24 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
     def RunForward(self, request, context):
         """Execute forward pass on the loaded shard."""
         start_time = time.time()
-        self._status = inference_pb2.NodeStatus.BUSY
+        request_id = request.request_id or ""
+
+        if request.reset_cache and request_id:
+            with self._status_lock:
+                self._cancelled_requests.discard(request_id)
+
+        with self._status_lock:
+            if request_id and request_id in self._cancelled_requests:
+                if context is not None:
+                    context.set_code(grpc.StatusCode.CANCELLED)
+                    context.set_details(f"request {request_id} was cancelled")
+                return inference_pb2.ActivationData()
+
+        if not self._try_acquire_lane():
+            if context is not None:
+                context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+                context.set_details("node forward lanes are saturated")
+            return inference_pb2.ActivationData()
 
         try:
             # Deserialize input tensors
@@ -112,7 +169,7 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                request_id=request.request_id,
+                request_id=request_id,
                 use_cache=request.use_cache,
                 reset_cache=request.reset_cache,
                 cache_position=request.cache_position,
@@ -130,8 +187,6 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 f"time={elapsed_ms:.1f}ms"
             )
 
-            self._status = inference_pb2.NodeStatus.READY
-
             return inference_pb2.ActivationData(
                 hidden_states=inference_pb2.TensorData(
                     data=output_bytes,
@@ -140,7 +195,7 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 ),
                 attention_mask=request.attention_mask,  # Pass through
                 position_ids=request.position_ids,  # Pass through
-                request_id=request.request_id,
+                request_id=request_id,
                 current_layer=self.executor.end_layer,
                 use_cache=request.use_cache,
                 reset_cache=False,
@@ -148,12 +203,17 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 is_prefill=request.is_prefill,
             )
 
+        except grpc.RpcError:
+            raise
         except Exception as e:
             log.error(f"Forward pass failed: {e}")
-            self._status = inference_pb2.NodeStatus.ERROR
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
+            self._set_status(inference_pb2.NodeStatus.ERROR)
+            if context is not None:
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(str(e))
             return inference_pb2.ActivationData()
+        finally:
+            self._release_lane()
 
     def Heartbeat(self, request, context):
         """Respond to health check with current status."""
@@ -165,30 +225,56 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
         """Unload the current model shard."""
         log.info("Unloading shard")
         self.executor.unload()
-        self._status = inference_pb2.NodeStatus.IDLE
+        self._set_status(inference_pb2.NodeStatus.IDLE)
         return self._build_status()
 
     def ClearRequestCache(self, request, context):
         """Clear cache state for one request or all requests."""
         if request.clear_all:
             self.executor.clear_all_cache()
+            with self._status_lock:
+                self._cancelled_requests.clear()
         elif request.request_id:
             self.executor.clear_request_cache(request.request_id)
+        return inference_pb2.Empty()
+
+    def CancelRequest(self, request, context):
+        """Cancel an in-flight request and clear its cache."""
+        if request.clear_all:
+            self.executor.clear_all_cache()
+            with self._status_lock:
+                self._cancelled_requests.clear()
+            return inference_pb2.Empty()
+
+        if request.request_id:
+            self.executor.clear_request_cache(request.request_id)
+            with self._status_lock:
+                self._cancelled_requests.add(request.request_id)
         return inference_pb2.Empty()
 
     def _build_status(self) -> inference_pb2.NodeStatus:
         """Build a NodeStatus protobuf message."""
         layer_info = self.executor.get_layer_info()
         assigned = list(range(layer_info["start_layer"], layer_info["end_layer"]))
+        with self._status_lock:
+            active_requests = self._active_requests
+            queue_depth = self._queue_depth
+            status = self._status
 
         return inference_pb2.NodeStatus(
             node_id=self.node_id,
-            status=self._status,
+            status=status,
             vram_used_mb=get_vram_usage_mb(),
             vram_total_mb=self._vram_total_mb,
             assigned_layers=assigned,
             load_percent=0.0,
             timestamp_ms=int(time.time() * 1000),
+            active_requests=active_requests,
+            queue_depth=queue_depth,
+            estimated_free_vram_mb=max(
+                self._vram_total_mb - get_vram_usage_mb(),
+                0,
+            ),
         )
 
 
@@ -196,8 +282,9 @@ def create_node_server(
     node_id: str,
     port: int,
     device_type: str = "cpu",
-    max_cached_requests: int = 1,
+    max_cached_requests: int = 8,
     max_cache_tokens_per_request: int = 4096,
+    max_concurrent_lanes: int = 4,
     max_workers: int = 4,
 ) -> grpc.Server:
     """Create and configure a gRPC server for the node.
@@ -227,6 +314,7 @@ def create_node_server(
         device_type=device_type,
         max_cached_requests=max_cached_requests,
         max_cache_tokens_per_request=max_cache_tokens_per_request,
+        max_concurrent_lanes=max_concurrent_lanes,
     )
     inference_pb2_grpc.add_NodeServiceServicer_to_server(servicer, server)
 
