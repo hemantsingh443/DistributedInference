@@ -34,41 +34,15 @@ cd DistributedInference
 pip install -e ".[dev]"
 ```
 
-### Run Web + Dynamic Onboarding
+### Run Web UI + Dynamic Onboarding
 
 ```bash
-python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0 --open-browser
+python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0 --enable-concurrent-scheduler --open-browser
 ```
 
-This starts coordinator + web UI, then lets you add/remove nodes at runtime from:
-- **Web UI**: Dynamic Node Onboarding panel
-- **CLI**: `python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 ...`
+This starts coordinator + web UI with concurrent scheduler enabled.
 
-> **Capacity note:** the model is loaded only when aggregate feasible VRAM is enough. If nodes are admitted but total capacity is still insufficient, inference remains unavailable until more capacity joins.
-
-CLI examples:
-
-```bash
-python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 list
-python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
-python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 stop --node-id web-node-1234abcd
-```
-
-### CLI Dynamic Workflow
-
-**Terminal 1 — Coordinator:**
-
-```bash
-python -m distributed_inference.cli.start_coordinator --port 50050
-```
-
-**Terminal 2 — Web gateway (required for `manage_nodes`):**
-
-```bash
-python -m distributed_inference.cli.start_web --host 127.0.0.1 --port 8000 --coordinator localhost:50050
-```
-
-**Terminal 3 — Dynamically add nodes from CLI:**
+Dynamically add nodes from CLI:
 
 ```bash
 python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 join --device auto --max-vram-mb 1024
@@ -83,6 +57,8 @@ python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000
 python -m distributed_inference.cli.manage_nodes --web-url http://127.0.0.1:8000 stop --node-id <node-id>
 ```
 
+> **Capacity note:** the model is loaded only when aggregate feasible VRAM is enough. If nodes are admitted but total capacity is still insufficient, inference remains unavailable until more capacity joins.
+
 **Run inference from CLI:**
 
 ```bash
@@ -95,6 +71,32 @@ Open `http://127.0.0.1:8000` in your browser to:
 - submit prompts from a UI
 - watch generated text stream token-by-token
 - view a per-hop timeline (node, layer range, latency) for every decode step
+
+### Concurrent Scheduler (What It Is)
+
+The concurrent scheduler enables multi-user inference with queueing + fairness at the coordinator:
+- request-level global admission (`max_concurrent_requests_global`, `max_queue_size`)
+- per-user fairness (`fairness_quantum_tokens`) to reduce starvation
+- capacity-aware dispatch using node telemetry (active lanes, queue depth, free VRAM)
+- scheduler metadata surfaced in stream events (`lane_id`, `queue_wait_ms`, `scheduler_retries`)
+
+### Browser Test: 2 Concurrent Users
+
+1. Start web stack with concurrent scheduler enabled:
+```bash
+python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0 --enable-concurrent-scheduler --open-browser
+```
+
+2. Open `http://127.0.0.1:8000`.
+3. In **User Registry** (left setup pane), add:
+- `user-a`
+- `user-b`
+4. Click **Start All Users**.
+
+The split-screen UI renders one stream panel per user and updates dynamically as users are added/removed. It also shows per-user scheduler metadata:
+- lane id
+- queue wait (ms)
+- scheduler retries
 
 ### Run Tests
 
@@ -130,8 +132,17 @@ model:
 coordinator:
   port: 50050
   heartbeat_interval_sec: 5.0
+  enable_concurrent_scheduler: false
   max_concurrent_requests_global: 4
   max_queue_size: 32
+  fairness_quantum_tokens: 16
+  tail_latency_guardrail_ms: 2500.0
+  scheduler_tick_ms: 10
+  max_dispatch_per_tick: 8
+  max_retry_attempts: 2
+  retry_backoff_ms: 25
+  ready_wait_timeout_sec: 30.0
+  ready_poll_interval_ms: 100
   node_load_failure_backoff_sec: 30.0
   min_vram_mb: 512
   min_compute_tflops: 0.5
@@ -171,9 +182,9 @@ Actual gains depend on prompt length, generated tokens, network overhead, and GP
 
 Run the same prompt twice and compare reported `tok/s` and total latency:
 
-1. Start coordinator + web dynamic stack:
+1. Start coordinator + web gateway:
 ```bash
-python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0
+python scripts/run_web_dynamic_demo.py --web-port 8000 --initial-nodes 0 --enable-concurrent-scheduler --open-browser
 ```
 
 2. Add sufficient capacity (example: three 1GB-cap nodes):
@@ -189,7 +200,9 @@ python -m distributed_inference.cli.run_inference --coordinator localhost:50050 
 ```
 
 4. KV cache disabled (temporary config override):
-Set `inference.enable_kv_cache: false` in your config and rerun the same command.
+- Set `inference.enable_kv_cache: false` in `configs/default.yaml`.
+- Restart the web stack so coordinator/nodes reload config.
+- Rerun the same inference command from step 3 and compare metrics.
 
 ## Key Design Decisions
 

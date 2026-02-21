@@ -94,6 +94,7 @@ message InferenceRequest {
   float temperature = 4;
   float top_p = 5;
   int32 top_k = 6;
+  string user_id = 7;
 }
 
 // Inference response to client
@@ -146,6 +147,11 @@ message InferenceEvent {
     InferenceResponse completed = 5;
     string error = 6;
   }
+
+  int32 lane_id = 7;
+  float queue_wait_ms = 8;
+  int32 scheduler_retries = 9;
+  string scheduler_policy = 10;
 }
 
 // Simple ack/ping

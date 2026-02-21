@@ -19,10 +19,17 @@ coordinator:
   max_concurrent_requests: 4
   max_concurrent_requests_global: 4
   max_queue_size: 32
+  enable_concurrent_scheduler: false
   scheduler_policy: "balanced"
   fairness_quantum_tokens: 16
   tail_latency_guardrail_ms: 2500.0
   per_node_vram_safety_margin: 0.9
+  scheduler_tick_ms: 10
+  max_dispatch_per_tick: 8
+  max_retry_attempts: 2
+  retry_backoff_ms: 25
+  ready_wait_timeout_sec: 30.0
+  ready_poll_interval_ms: 100
   min_vram_mb: 512
   min_compute_tflops: 0.5
   gpu_required: false

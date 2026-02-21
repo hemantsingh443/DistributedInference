@@ -93,6 +93,12 @@ def _sse(event_type: str, payload: dict) -> str:
 
 def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
     kind = event.WhichOneof("payload")
+    scheduler_meta = {
+        "lane_id": event.lane_id,
+        "queue_wait_ms": event.queue_wait_ms,
+        "scheduler_retries": event.scheduler_retries,
+        "scheduler_policy": event.scheduler_policy,
+    }
 
     if kind == "hop":
         payload = {
@@ -105,6 +111,7 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
             "start_layer": event.hop.start_layer,
             "end_layer": event.hop.end_layer,
             "hop_latency_ms": event.hop.hop_latency_ms,
+            **scheduler_meta,
         }
         return "hop", payload
 
@@ -116,6 +123,7 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
             "token_id": event.token.token_id,
             "token_text": event.token.token_text,
             "accumulated_text": event.token.accumulated_text,
+            **scheduler_meta,
         }
         return "token", payload
 
@@ -128,6 +136,7 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
             "total_latency_ms": event.completed.total_latency_ms,
             "tokens_per_second": event.completed.tokens_per_second,
             "per_hop_latency_ms": list(event.completed.per_hop_latency_ms),
+            **scheduler_meta,
         }
         return "completed", payload
 
@@ -135,6 +144,7 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
         "request_id": event.request_id,
         "timestamp_ms": event.timestamp_ms,
         "message": event.error,
+        **scheduler_meta,
     }
     return "error", payload
 
@@ -559,6 +569,7 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
         top_k: int = Query(50, ge=0, le=2000),
         coordinator: str | None = Query(None),
         request_id: str | None = Query(None),
+        user_id: str | None = Query(None),
     ):
         request_id = request_id or uuid.uuid4().hex[:8]
         coordinator_addr = coordinator or request.app.state.default_coordinator
@@ -590,6 +601,7 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                user_id=user_id or "",
             )
 
             try:
@@ -598,7 +610,10 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
                     request.app.state.logs.append(
                         request_id, {"type": event_type, **payload}
                     )
-                    yield _sse(event_type, payload)
+                    sse_event = (
+                        "inference_error" if event_type == "error" else event_type
+                    )
+                    yield _sse(sse_event, payload)
 
             except grpc.RpcError as rpc_error:
                 payload = {
@@ -611,7 +626,7 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
                     f"{rpc_error.code()} {rpc_error.details()}"
                 )
                 request.app.state.logs.append(request_id, {"type": "error", **payload})
-                yield _sse("error", payload)
+                yield _sse("inference_error", payload)
             finally:
                 channel.close()
 

@@ -66,6 +66,11 @@ def main() -> None:
     parser.add_argument("--web-port", type=int, default=8000)
     parser.add_argument("--initial-nodes", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument(
+        "--enable-concurrent-scheduler",
+        action="store_true",
+        help="Enable concurrent multi-user scheduler in coordinator",
+    )
     parser.add_argument("--startup-timeout", type=float, default=60.0)
     parser.add_argument("--open-browser", action="store_true")
     parser.add_argument(
@@ -84,6 +89,8 @@ def main() -> None:
     config = load_config()
     config.coordinator.host = args.coordinator_host
     config.coordinator.port = args.coordinator_port
+    if args.enable_concurrent_scheduler:
+        config.coordinator.enable_concurrent_scheduler = True
 
     orchestrator = Orchestrator(config=config)
     web_proc: subprocess.Popen | None = None
@@ -135,6 +142,8 @@ def main() -> None:
 
             if not orchestrator.wait_for_nodes(args.initial_nodes, timeout=args.startup_timeout):
                 raise RuntimeError("Initial nodes did not register in time")
+            log.info("Running initial model setup across registered nodes")
+            orchestrator.setup_model()
 
         print("\nDynamic onboarding commands:")
         print(f"  List nodes: python -m distributed_inference.cli.manage_nodes --web-url {web_url} list")

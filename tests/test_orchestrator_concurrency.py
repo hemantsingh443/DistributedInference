@@ -280,3 +280,109 @@ def test_supports_four_concurrent_active_requests():
         worker.join(timeout=2.0)
 
     assert len(results) == 4
+
+
+def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
+    config = SystemConfig()
+    config.inference.enable_kv_cache = False
+    config.coordinator.enable_concurrent_scheduler = True
+    config.coordinator.max_concurrent_requests_global = 2
+    config.coordinator.max_queue_size = 4
+
+    stage = PipelineStage(
+        node_id="node-1",
+        address="localhost:50051",
+        start_layer=0,
+        end_layer=22,
+        has_embedding=True,
+        has_lm_head=True,
+    )
+    router = ControlledRouter(stage=stage, delay_sec=0.0)
+    orchestrator = _build_ready_orchestrator(config=config, router=router)
+    orchestrator.registry.register(
+        node_id="node-1",
+        address="localhost:50051",
+        vram_mb=2048,
+        compute_tflops=1.0,
+        bandwidth_mbps=1000.0,
+        device_type="cpu",
+        device_name="test",
+    )
+    orchestrator.registry.update_heartbeat(
+        node_id="node-1",
+        vram_used_mb=128,
+        active_requests=0,
+        queue_depth=0,
+        estimated_free_vram_mb=1800,
+    )
+
+    try:
+        events = list(
+            orchestrator.run_inference_stream(
+                prompt="test",
+                max_tokens=1,
+                temperature=0.0,
+                request_id="sched-1",
+                user_id="user-alpha",
+            )
+        )
+    finally:
+        if orchestrator._concurrent_scheduler is not None:
+            orchestrator._concurrent_scheduler.stop()
+
+    assert len(events) >= 2
+    first = events[0]
+    assert first.scheduler_policy == "balanced"
+    assert first.lane_id > 0
+    assert first.queue_wait_ms >= 0
+    assert first.scheduler_retries >= 0
+
+
+def test_run_inference_stream_waits_for_model_readiness():
+    config = SystemConfig()
+    config.inference.enable_kv_cache = False
+    config.coordinator.ready_wait_timeout_sec = 0.5
+    config.coordinator.ready_poll_interval_ms = 10
+
+    stage = PipelineStage(
+        node_id="node-1",
+        address="localhost:50051",
+        start_layer=0,
+        end_layer=22,
+        has_embedding=True,
+        has_lm_head=True,
+    )
+    router = ControlledRouter(stage=stage, delay_sec=0.0)
+    orchestrator = _build_ready_orchestrator(config=config, router=router)
+    with orchestrator._state_lock:
+        orchestrator._model_loaded = False
+        orchestrator._partition_plan = None
+        orchestrator._execution_plan = None
+
+    def _mark_ready():
+        time.sleep(0.05)
+        with orchestrator._state_lock:
+            orchestrator._partition_plan = PartitionPlan(
+                assignments=[],
+                model_name="dummy",
+                total_layers=22,
+            )
+            orchestrator._execution_plan = ExecutionPlan(
+                stages=[stage],
+                estimated_total_ms=1.0,
+            )
+            orchestrator._model_loaded = True
+
+    warmup = threading.Thread(target=_mark_ready, daemon=True)
+    warmup.start()
+    events = list(
+        orchestrator.run_inference_stream(
+            prompt="warmup",
+            max_tokens=1,
+            temperature=0.0,
+            request_id="warmup-req",
+        )
+    )
+    warmup.join(timeout=1.0)
+
+    assert any(event.WhichOneof("payload") == "completed" for event in events)

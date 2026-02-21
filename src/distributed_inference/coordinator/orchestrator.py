@@ -21,6 +21,10 @@ from transformers import AutoTokenizer
 from distributed_inference.common.config import SystemConfig, load_config
 from distributed_inference.common.logging import get_logger
 from distributed_inference.coordinator.admission import AdmissionController
+from distributed_inference.coordinator.concurrent_scheduler import (
+    ConcurrentRequestScheduler,
+    SchedulerTicket,
+)
 from distributed_inference.coordinator.partitioner import partition_model, PartitionPlan
 from distributed_inference.coordinator.rebalancer import RebalanceController
 from distributed_inference.coordinator.registry import NodeRegistry, NodeState
@@ -48,8 +52,12 @@ class RequestCancelledError(RuntimeError):
 class RequestContext:
     """Tracks mutable lifecycle state for a single inference request."""
     request_id: str
+    user_id: str = ""
     created_at: float = field(default_factory=time.time)
     queue_wait_ms: float = 0.0
+    scheduler_retries: int = 0
+    lane_id: int = 0
+    state: str = "QUEUED"
     cancel_reason: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
@@ -141,6 +149,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 top_p=request.top_p or 0.9,
                 top_k=request.top_k or 50,
                 request_id=request.request_id or uuid.uuid4().hex[:8],
+                user_id=request.user_id,
             )
             return result
 
@@ -184,6 +193,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 top_p=request.top_p or 0.9,
                 top_k=request.top_k or 50,
                 request_id=request_id,
+                user_id=request.user_id,
             ):
                 if not context.is_active():
                     self.orchestrator.cancel_inference(
@@ -269,6 +279,45 @@ class Orchestrator:
             0,
             int(getattr(self.config.coordinator, "max_queue_size", 32)),
         )
+        self._concurrent_scheduler_enabled = bool(
+            getattr(self.config.coordinator, "enable_concurrent_scheduler", False)
+        )
+        self._scheduler_policy = str(
+            getattr(self.config.coordinator, "scheduler_policy", "balanced")
+        )
+        self._concurrent_scheduler: Optional[ConcurrentRequestScheduler] = None
+        if self._concurrent_scheduler_enabled:
+            self._concurrent_scheduler = ConcurrentRequestScheduler(
+                registry=self.registry,
+                max_concurrent_requests=self._max_concurrent_requests,
+                max_queue_size=self._max_queue_size,
+                scheduler_policy=self._scheduler_policy,
+                fairness_quantum_tokens=getattr(
+                    self.config.coordinator, "fairness_quantum_tokens", 16
+                ),
+                tail_latency_guardrail_ms=getattr(
+                    self.config.coordinator, "tail_latency_guardrail_ms", 2500.0
+                ),
+                per_node_vram_safety_margin=getattr(
+                    self.config.coordinator, "per_node_vram_safety_margin", 0.9
+                ),
+                max_retry_attempts=getattr(
+                    self.config.coordinator, "max_retry_attempts", 2
+                ),
+                retry_backoff_ms=getattr(
+                    self.config.coordinator, "retry_backoff_ms", 25
+                ),
+                scheduler_tick_ms=getattr(
+                    self.config.coordinator, "scheduler_tick_ms", 10
+                ),
+                max_dispatch_per_tick=getattr(
+                    self.config.coordinator, "max_dispatch_per_tick", 8
+                ),
+                node_max_concurrent_lanes=getattr(
+                    self.config.node, "max_concurrent_lanes", 4
+                ),
+                on_metrics=self._on_scheduler_metrics,
+            )
         self._plan_version = 0
         self._last_rebalance_reason = ""
         self._rebalance_lock = threading.RLock()
@@ -340,10 +389,19 @@ class Orchestrator:
         log.info("Stopping coordinator...")
         self._running = False
         self._rebalance_controller.stop()
+        if self._concurrent_scheduler is not None:
+            self._concurrent_scheduler.stop()
         if self._server:
             self._server.stop(grace=5)
         self.router.close()
         log.info("Coordinator stopped")
+
+    def _on_scheduler_metrics(self, active_requests: int, queued_requests: int) -> None:
+        """Mirror scheduler counters for legacy observability and tests."""
+        with self._state_lock:
+            self._active_requests = max(0, int(active_requests))
+            self._queued_requests = max(0, int(queued_requests))
+            self._request_cond.notify_all()
 
     def wait_for_nodes(self, min_nodes: int, timeout: float = 60.0) -> bool:
         """Wait until minimum number of nodes have registered.
@@ -649,19 +707,29 @@ class Orchestrator:
         with self._state_lock:
             self._accepting_requests = False
             self._request_cond.notify_all()
+        if self._concurrent_scheduler is not None:
+            self._concurrent_scheduler.set_accepting(False)
 
     def _end_drain(self) -> None:
         with self._state_lock:
             self._accepting_requests = True
             self._request_cond.notify_all()
+        if self._concurrent_scheduler is not None:
+            self._concurrent_scheduler.set_accepting(True)
 
     def _wait_for_drain(self, timeout_sec: float) -> bool:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            with self._state_lock:
-                if self._active_requests == 0:
+            if self._concurrent_scheduler is not None:
+                if self._concurrent_scheduler.active_count == 0:
                     return True
+            else:
+                with self._state_lock:
+                    if self._active_requests == 0:
+                        return True
             time.sleep(0.05)
+        if self._concurrent_scheduler is not None:
+            return self._concurrent_scheduler.active_count == 0
         with self._state_lock:
             return self._active_requests == 0
 
@@ -701,13 +769,44 @@ class Orchestrator:
             self._active_requests = max(self._active_requests - 1, 0)
             self._request_cond.notify_all()
 
-    def _register_request_context(self, request_id: str) -> RequestContext:
+    def _acquire_request_slot(
+        self,
+        request_context: RequestContext,
+        execution_plan: ExecutionPlan,
+    ) -> Optional[SchedulerTicket]:
+        """Acquire request concurrency slot via legacy gate or concurrent scheduler."""
+        if self._concurrent_scheduler is None:
+            request_context.queue_wait_ms = self._enter_request(request_context.request_id)
+            request_context.state = "PREFILL"
+            return None
+
+        ticket = self._concurrent_scheduler.acquire(
+            request_id=request_context.request_id,
+            user_id=request_context.user_id,
+            execution_plan=execution_plan,
+            cancel_event=request_context.cancel_event,
+        )
+        request_context.queue_wait_ms = ticket.queue_wait_ms
+        request_context.scheduler_retries = ticket.scheduler_retries
+        request_context.lane_id = ticket.lane_id
+        request_context.state = "PREFILL"
+        return ticket
+
+    def _release_request_slot(self, request_id: str, ticket: Optional[SchedulerTicket]) -> None:
+        """Release request slot acquired by _acquire_request_slot."""
+        if self._concurrent_scheduler is None:
+            self._exit_request()
+            return
+        if ticket is not None:
+            self._concurrent_scheduler.release(request_id)
+
+    def _register_request_context(self, request_id: str, user_id: str = "") -> RequestContext:
         with self._contexts_lock:
             if request_id in self._request_contexts:
                 raise RuntimeError(
                     f"request_id '{request_id}' is already active"
                 )
-            context = RequestContext(request_id=request_id)
+            context = RequestContext(request_id=request_id, user_id=user_id)
             self._request_contexts[request_id] = context
             return context
 
@@ -748,6 +847,7 @@ class Orchestrator:
         if context is None:
             return False
         context.cancel_reason = reason
+        context.state = "CANCELLED"
         context.cancel_event.set()
 
         with self._state_lock:
@@ -759,8 +859,54 @@ class Orchestrator:
                     request_id=request_id,
                 )
             except Exception as e:
-                log.warning(f"Best-effort cancel propagation failed: {e}")
+                    log.warning(f"Best-effort cancel propagation failed: {e}")
         return True
+
+    def _scheduler_event_fields(self, context: RequestContext) -> dict:
+        """Return scheduler metadata fields for InferenceEvent."""
+        return {
+            "lane_id": int(context.lane_id),
+            "queue_wait_ms": float(context.queue_wait_ms),
+            "scheduler_retries": int(context.scheduler_retries),
+            "scheduler_policy": self._scheduler_policy,
+        }
+
+    def _await_model_ready(self, request_context: RequestContext) -> None:
+        """Wait briefly for model readiness so warmup races don't fail requests."""
+        with self._state_lock:
+            if self.is_ready:
+                return
+
+        timeout_sec = float(
+            getattr(self.config.coordinator, "ready_wait_timeout_sec", 0.0)
+        )
+        if timeout_sec <= 0.0:
+            raise RuntimeError("Model not set up. Call setup_model() first.")
+
+        poll_ms = int(
+            getattr(self.config.coordinator, "ready_poll_interval_ms", 100)
+        )
+        poll_sec = max(10, poll_ms) / 1000.0
+        deadline = time.time() + timeout_sec
+
+        log.info(
+            f"Request {request_context.request_id} waiting for model readiness "
+            f"(timeout={timeout_sec:.1f}s)"
+        )
+        while time.time() < deadline:
+            self._assert_not_cancelled(request_context)
+            with self._state_lock:
+                if self.is_ready:
+                    return
+            time.sleep(poll_sec)
+
+        with self._state_lock:
+            if self.is_ready:
+                return
+        raise RuntimeError(
+            "Model not set up. Call setup_model() first. "
+            f"still warming up after {timeout_sec:.1f}s"
+        )
 
     def run_inference(
         self,
@@ -770,6 +916,7 @@ class Orchestrator:
         top_p: float = 0.9,
         top_k: int = 50,
         request_id: str = "",
+        user_id: str = "",
     ) -> inference_pb2.InferenceResponse:
         """Run inference and return the final aggregated response."""
         completed = None
@@ -782,6 +929,7 @@ class Orchestrator:
             top_p=top_p,
             top_k=top_k,
             request_id=stream_request_id,
+            user_id=user_id,
         ):
             if event.WhichOneof("payload") == "completed":
                 completed = event.completed
@@ -802,29 +950,32 @@ class Orchestrator:
         top_p: float = 0.9,
         top_k: int = 50,
         request_id: str = "",
+        user_id: str = "",
     ) -> Iterator[inference_pb2.InferenceEvent]:
         """Run inference and yield streaming hop/token/completion events."""
         request_id = request_id or uuid.uuid4().hex[:8]
-        request_context = self._register_request_context(request_id)
+        request_context = self._register_request_context(request_id, user_id=user_id)
         entered = False
+        scheduler_ticket: Optional[SchedulerTicket] = None
         execution_plan: Optional[ExecutionPlan] = None
         use_kv_cache = False
+        completed_successfully = False
 
         try:
-            request_context.queue_wait_ms = self._enter_request(request_id)
-            entered = True
-
-            if not self.is_ready:
-                raise RuntimeError("Model not set up. Call setup_model() first.")
+            self._await_model_ready(request_context)
             with self._state_lock:
                 execution_plan = self._execution_plan
             if not execution_plan:
                 raise RuntimeError("No execution plan available")
 
+            scheduler_ticket = self._acquire_request_slot(request_context, execution_plan)
+            entered = True
+
             start_time = time.time()
             use_kv_cache = bool(
                 getattr(self.config.inference, "enable_kv_cache", False)
             )
+            event_fields = self._scheduler_event_fields(request_context)
 
             inputs = self._tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"]
@@ -863,6 +1014,7 @@ class Orchestrator:
                             end_layer=trace.stage.end_layer,
                             hop_latency_ms=trace.hop_latency_ms,
                         ),
+                        **event_fields,
                     )
 
                 if logits is None:
@@ -870,6 +1022,7 @@ class Orchestrator:
 
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
+                    request_context.state = "DECODING"
                     if step > 0:
                         decode_input = input_ids[:, -1:]
                         decode_cache_pos = int(input_ids.shape[1] - 1)
@@ -901,6 +1054,7 @@ class Orchestrator:
                                     end_layer=trace.stage.end_layer,
                                     hop_latency_ms=trace.hop_latency_ms,
                                 ),
+                                **event_fields,
                             )
                         if logits is None:
                             raise RuntimeError(
@@ -944,10 +1098,12 @@ class Orchestrator:
                             token_text=token_text,
                             accumulated_text=accumulated_text,
                         ),
+                        **event_fields,
                     )
             else:
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
+                    request_context.state = "DECODING"
                     logits = None
                     for trace in self.router.route_forward_stream(
                         input_ids=input_ids,
@@ -974,6 +1130,7 @@ class Orchestrator:
                                 end_layer=trace.stage.end_layer,
                                 hop_latency_ms=trace.hop_latency_ms,
                             ),
+                            **event_fields,
                         )
 
                     if logits is None:
@@ -1016,6 +1173,7 @@ class Orchestrator:
                             token_text=token_text,
                             accumulated_text=accumulated_text,
                         ),
+                        **event_fields,
                     )
 
             generated_text = self._tokenizer.decode(
@@ -1044,8 +1202,16 @@ class Orchestrator:
                     per_hop_latency_ms=all_hop_latencies,
                     tokens_per_second=tokens_per_sec,
                 ),
+                **event_fields,
             )
+            completed_successfully = True
         finally:
+            if completed_successfully:
+                request_context.state = "COMPLETED"
+            elif request_context.cancel_event.is_set():
+                request_context.state = "CANCELLED"
+            else:
+                request_context.state = "FAILED"
             if use_kv_cache and execution_plan:
                 try:
                     self.router.clear_request_cache_on_pipeline(
@@ -1055,7 +1221,7 @@ class Orchestrator:
                 except Exception as e:
                     log.warning(f"Cache cleanup failed for {request_id}: {e}")
             if entered:
-                self._exit_request()
+                self._release_request_slot(request_id=request_id, ticket=scheduler_ticket)
             self._unregister_request_context(request_id)
 
     @staticmethod

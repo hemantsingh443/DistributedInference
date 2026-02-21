@@ -65,6 +65,23 @@ class _FakeStub:
         )
 
 
+class _FakeErrorStub:
+    def SubmitInferenceStream(self, request, timeout=None):
+        del timeout
+        yield inference_pb2.InferenceEvent(
+            request_id=request.request_id,
+            timestamp_ms=5,
+            error="Model not set up. Call setup_model() first.",
+        )
+
+    def CancelInference(self, request, timeout=None):
+        del timeout
+        return inference_pb2.CancelInferenceResponse(
+            accepted=True,
+            status=f"cancelled {request.request_id}",
+        )
+
+
 class _FakeProcess:
     _pid_counter = 9999
 
@@ -149,6 +166,37 @@ def test_cancel_run_endpoint(monkeypatch):
     body = response.json()
     assert body["accepted"] is True
     assert body["request_id"] == "req-cancel"
+
+
+def test_sse_inference_error_event_name(monkeypatch):
+    monkeypatch.setattr(
+        web_app_module.grpc,
+        "insecure_channel",
+        lambda *args, **kwargs: _DummyChannel(),
+    )
+    monkeypatch.setattr(
+        web_app_module.inference_pb2_grpc,
+        "CoordinatorServiceStub",
+        lambda channel: _FakeErrorStub(),
+    )
+
+    app = web_app_module.create_app(default_coordinator="localhost:50050")
+    client = TestClient(app)
+
+    with client.stream(
+        "GET",
+        "/api/stream",
+        params={"prompt": "hello", "request_id": "req-web-err"},
+    ) as response:
+        text = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: start" in text
+    assert "event: inference_error" in text
+    run_response = client.get("/api/runs/req-web-err")
+    assert run_response.status_code == 200
+    payload = run_response.json()
+    assert payload["events"][-1]["type"] == "error"
 
 
 def test_dynamic_node_api_join_list_stop(monkeypatch):

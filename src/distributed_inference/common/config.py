@@ -35,10 +35,17 @@ class CoordinatorConfig:
     max_concurrent_requests: int = 4
     max_concurrent_requests_global: int = 4
     max_queue_size: int = 32
+    enable_concurrent_scheduler: bool = False
     scheduler_policy: str = "balanced"
     fairness_quantum_tokens: int = 16
     tail_latency_guardrail_ms: float = 2500.0
     per_node_vram_safety_margin: float = 0.9
+    scheduler_tick_ms: int = 10
+    max_dispatch_per_tick: int = 8
+    max_retry_attempts: int = 2
+    retry_backoff_ms: int = 25
+    ready_wait_timeout_sec: float = 30.0
+    ready_poll_interval_ms: int = 100
     min_vram_mb: int = 512
     min_compute_tflops: float = 0.5
     gpu_required: bool = False

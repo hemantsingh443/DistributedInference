@@ -8,14 +8,14 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260221d" />
 </head>
 <body>
   <div class="ambient"></div>
   <main class="shell">
     <header class="hero">
       <p class="kicker">Distributed Inference</p>
-      <h1>Live Hop + Token Stream Console</h1>
+      <h1>Multi-User Streaming Console</h1>
       <div
         id="health-chip"
         class="health"
@@ -25,115 +25,138 @@
       ></div>
     </header>
 
-    <section class="panel controls">
-      <form id="prompt-form">
-        <label for="prompt">Prompt</label>
-        <textarea id="prompt" name="prompt" rows="4" required>The future of AI is</textarea>
+    <section class="workspace">
+      <aside class="setup-pane">
+        <section class="panel">
+          <div class="panel-title">One-Time Setup</div>
+          <form id="global-config-form">
+            <label>Coordinator
+              <input id="coordinator" name="coordinator" value="{{ default_coordinator }}" />
+            </label>
+            <label>Shared Prompt
+              <textarea id="global_prompt" name="global_prompt" rows="3">The future of AI is</textarea>
+            </label>
+            <div class="grid compact-grid">
+              <label>Max Tokens
+                <input id="max_tokens" name="max_tokens" type="number" min="1" max="512" value="50" />
+              </label>
+              <label>Temperature
+                <input id="temperature" name="temperature" type="number" step="0.1" min="0" max="2" value="0.7" />
+              </label>
+              <label>Top P
+                <input id="top_p" name="top_p" type="number" step="0.05" min="0" max="1" value="0.9" />
+              </label>
+              <label>Top K
+                <input id="top_k" name="top_k" type="number" min="0" max="2000" value="50" />
+              </label>
+            </div>
+            <div class="actions">
+              <button id="start-all-btn" type="button">Start All Users</button>
+              <button id="cancel-all-btn" type="button" class="secondary">Cancel Active</button>
+            </div>
+            <p id="status" class="muted">Idle</p>
+          </form>
+        </section>
 
-        <div class="grid">
-          <label>Coordinator
-            <input id="coordinator" name="coordinator" value="{{ default_coordinator }}" />
-          </label>
-          <label>Max Tokens
-            <input id="max_tokens" name="max_tokens" type="number" min="1" max="512" value="50" />
-          </label>
-          <label>Temperature
-            <input id="temperature" name="temperature" type="number" step="0.1" min="0" max="2" value="0.7" />
-          </label>
-          <label>Top P
-            <input id="top_p" name="top_p" type="number" step="0.05" min="0" max="1" value="0.9" />
-          </label>
-          <label>Top K
-            <input id="top_k" name="top_k" type="number" min="0" max="2000" value="50" />
-          </label>
-        </div>
+        <section class="panel">
+          <div class="panel-title">User Registry</div>
+          <form id="user-form" class="stack-form">
+            <label>User ID
+              <input id="user_id_input" name="user_id" placeholder="user-a" required />
+            </label>
+            <label>Prompt Override (optional)
+              <textarea id="user_prompt_override" name="prompt_override" rows="2" placeholder="Leave empty to use Shared Prompt"></textarea>
+            </label>
+            <button id="add-user-btn" type="submit">Add User</button>
+          </form>
+          <div id="users-config-list" class="users-config-list"></div>
+          <p id="users-summary" class="muted">0 configured users</p>
+        </section>
 
-        <div class="actions">
-          <button id="run-btn" type="submit">Run Inference</button>
-          <span id="status" class="muted">Idle</span>
-        </div>
-      </form>
-    </section>
+        <section class="panel">
+          <div class="panel-title">Dynamic Node Onboarding</div>
+          <form id="node-form" class="stack-form">
+            <label>Node ID (optional)
+              <input id="node_id" name="node_id" placeholder="web-node-..." />
+            </label>
+            <div class="grid compact-grid">
+              <label>Port (optional)
+                <input id="node_port" name="port" type="number" min="1024" max="65535" placeholder="auto" />
+              </label>
+              <label>Device
+                <input id="node_device" name="device" value="auto" />
+              </label>
+              <label>VRAM Cap MB
+                <input id="node_max_vram_mb" name="max_vram_mb" type="number" min="128" placeholder="1024" />
+              </label>
+              <label>Bandwidth Mbps
+                <input id="node_bandwidth_mbps" name="bandwidth_mbps" type="number" min="1" step="1" placeholder="1000" />
+              </label>
+              <label>Latency ms
+                <input id="node_latency_ms" name="latency_ms" type="number" min="0.1" step="0.1" placeholder="5.0" />
+              </label>
+            </div>
+            <div class="actions">
+              <button id="join-btn" type="submit">Join Node</button>
+              <button id="refresh-nodes-btn" type="button" class="secondary">Refresh</button>
+            </div>
+            <p id="node-status" class="muted">No managed nodes</p>
+          </form>
 
-    <section class="panel nodes">
-      <div class="panel-title">Dynamic Node Onboarding</div>
-      <form id="node-form">
-        <div class="grid node-grid">
-          <label>Coordinator
-            <input id="node_coordinator" name="coordinator" value="{{ default_coordinator }}" />
-          </label>
-          <label>Node ID (optional)
-            <input id="node_id" name="node_id" placeholder="web-node-..." />
-          </label>
-          <label>Port (optional)
-            <input id="node_port" name="port" type="number" min="1024" max="65535" placeholder="auto" />
-          </label>
-          <label>Device
-            <input id="node_device" name="device" value="auto" />
-          </label>
-          <label>VRAM Cap MB (optional)
-            <input id="node_max_vram_mb" name="max_vram_mb" type="number" min="128" placeholder="1024" />
-          </label>
-          <label>Bandwidth Mbps (optional)
-            <input id="node_bandwidth_mbps" name="bandwidth_mbps" type="number" min="1" step="1" placeholder="1000" />
-          </label>
-          <label>Latency ms (optional)
-            <input id="node_latency_ms" name="latency_ms" type="number" min="0.1" step="0.1" placeholder="5.0" />
-          </label>
-        </div>
+          <div class="panel-title">CLI Equivalent</div>
+          <pre id="cli-preview" class="text-stream cli-preview"></pre>
 
-        <div class="actions">
-          <button id="join-btn" type="submit">Join Node</button>
-          <button id="refresh-nodes-btn" type="button" class="secondary">Refresh Nodes</button>
-          <span id="node-status" class="muted">No managed nodes</span>
-        </div>
-      </form>
+          <div class="panel-title">Managed Nodes</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>Port</th>
+                  <th>PID</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="nodes-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </aside>
 
-      <div class="panel-title">CLI Equivalent</div>
-      <pre id="cli-preview" class="text-stream cli-preview"></pre>
+      <section class="stream-pane">
+        <section class="panel">
+          <div class="panel-title">Live User Streams</div>
+          <div id="streams-placeholder" class="empty-state">
+            Add users in the setup pane, then start streams to watch them run concurrently.
+          </div>
+          <div id="user-streams" class="user-streams-grid"></div>
+        </section>
 
-      <div class="panel-title">Managed Nodes</div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Node</th>
-              <th>Port</th>
-              <th>PID</th>
-              <th>Status</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody id="nodes-body"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="panel output">
-      <div class="panel-title">Generated Text</div>
-      <pre id="generated-text" class="text-stream"></pre>
-      <div id="metrics" class="metrics"></div>
-    </section>
-
-    <section class="panel hops">
-      <div class="panel-title">Hop Timeline</div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Step</th>
-              <th>Hop</th>
-              <th>Node</th>
-              <th>Layers</th>
-              <th>Latency</th>
-            </tr>
-          </thead>
-          <tbody id="hop-body"></tbody>
-        </table>
-      </div>
+        <section class="panel">
+          <div class="panel-title">Global Hop Timeline</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Request</th>
+                  <th>User</th>
+                  <th>Step</th>
+                  <th>Hop</th>
+                  <th>Node</th>
+                  <th>Layers</th>
+                  <th>Latency</th>
+                  <th>Lane</th>
+                </tr>
+              </thead>
+              <tbody id="hop-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260221d"></script>
 </body>
 </html>

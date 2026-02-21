@@ -228,13 +228,29 @@ class NodeAgent:
         stub = self._get_coordinator_stub()
         from distributed_inference.node.resources import get_vram_usage_mb
 
-        status = inference_pb2.NodeStatus(
-            node_id=self.node_id,
-            status=inference_pb2.NodeStatus.READY,
-            vram_used_mb=get_vram_usage_mb(),
-            vram_total_mb=self.capabilities.vram_mb,
-            timestamp_ms=int(time.time() * 1000),
-        )
+        status = None
+        servicer = getattr(self.server, "_di_servicer", None)
+        if servicer is not None and hasattr(servicer, "_build_status"):
+            try:
+                status = servicer._build_status()
+                status.node_id = self.node_id
+            except Exception:
+                status = None
+
+        if status is None:
+            status = inference_pb2.NodeStatus(
+                node_id=self.node_id,
+                status=inference_pb2.NodeStatus.READY,
+                vram_used_mb=get_vram_usage_mb(),
+                vram_total_mb=self.capabilities.vram_mb,
+                timestamp_ms=int(time.time() * 1000),
+                active_requests=0,
+                queue_depth=0,
+                estimated_free_vram_mb=max(
+                    self.capabilities.vram_mb - get_vram_usage_mb(),
+                    0,
+                ),
+            )
 
         try:
             stub.ReportHealth(status, timeout=5)

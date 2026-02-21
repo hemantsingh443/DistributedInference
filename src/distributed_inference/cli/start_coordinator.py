@@ -33,6 +33,11 @@ def main():
         help="Automatically set up model once min-nodes register"
     )
     parser.add_argument(
+        "--enable-concurrent-scheduler",
+        action="store_true",
+        help="Enable multi-user concurrent scheduler and fairness runtime",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)"
@@ -45,6 +50,8 @@ def main():
     config = load_config(args.config)
     config.coordinator.port = args.port
     config.coordinator.host = args.host
+    if args.enable_concurrent_scheduler:
+        config.coordinator.enable_concurrent_scheduler = True
 
     orchestrator = Orchestrator(config=config)
 

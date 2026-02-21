@@ -317,6 +317,8 @@ def create_node_server(
         max_concurrent_lanes=max_concurrent_lanes,
     )
     inference_pb2_grpc.add_NodeServiceServicer_to_server(servicer, server)
+    # Expose servicer for local heartbeat snapshots from NodeAgent.
+    setattr(server, "_di_servicer", servicer)
 
     server.add_insecure_port(f"[::]:{port}")
 

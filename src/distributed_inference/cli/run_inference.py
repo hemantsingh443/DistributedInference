@@ -40,6 +40,10 @@ def main():
         "--top-k", type=int, default=50,
         help="Top-k sampling parameter (default: 50)"
     )
+    parser.add_argument(
+        "--user-id", type=str, default="",
+        help="Optional user identifier for scheduler fairness"
+    )
 
     args = parser.parse_args()
 
@@ -59,6 +63,7 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
+        user_id=args.user_id,
     )
 
     log.info(f"Sending inference request: '{args.prompt[:50]}...'")
