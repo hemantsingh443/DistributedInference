@@ -175,7 +175,9 @@
       <td>${event.lane_id || "-"}</td>
     `;
     hopsBody.appendChild(row);
-    row.scrollIntoView({ behavior: "smooth", block: "end" });
+    // Scroll only the table container, not the page
+    const wrap = hopsBody.closest(".table-wrap");
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
   };
 
   const buildUserConfigRow = (user) => {
@@ -320,6 +322,8 @@
       reconnectAttempts: 0,
       maxReconnectAttempts: 30,
       reconnectDelayMs: 2000,
+      disconnectRetries: 0,
+      maxDisconnectRetries: 5,
       expectingReconnect: false,
       metrics: {
         laneId: null,
@@ -384,6 +388,7 @@
       run.source = source;
 
       source.addEventListener("start", () => {
+        run.disconnectRetries = 0;
         setUserState(user, "Streaming", "running");
       });
 
@@ -441,6 +446,25 @@
           return;
         }
         if (run.expectingReconnect) {
+          return;
+        }
+        // Auto-retry on unexpected disconnect (scheduler busy, etc.)
+        if (run.disconnectRetries < run.maxDisconnectRetries) {
+          run.disconnectRetries += 1;
+          run.expectingReconnect = true;
+          setUserState(
+            user,
+            `Reconnecting ${run.disconnectRetries}/${run.maxDisconnectRetries}`,
+            "pending",
+          );
+          closeRunSource(run);
+          window.setTimeout(() => {
+            if (!runs.has(run.requestId) || !run.active) {
+              return;
+            }
+            run.expectingReconnect = false;
+            attachSource();
+          }, run.reconnectDelayMs);
           return;
         }
         finalizeRun("Disconnected", "error");
