@@ -3,7 +3,6 @@
   const statusEl = byId("status");
   const nodeStatusEl = byId("node-status");
   const coordinatorInput = byId("coordinator");
-  const globalPromptInput = byId("global_prompt");
   const maxTokensInput = byId("max_tokens");
   const temperatureInput = byId("temperature");
   const topPInput = byId("top_p");
@@ -12,7 +11,7 @@
   const cancelAllBtn = byId("cancel-all-btn");
   const userForm = byId("user-form");
   const userIdInput = byId("user_id_input");
-  const userPromptOverrideInput = byId("user_prompt_override");
+  const userPromptInput = byId("user_prompt_input");
   const usersConfigList = byId("users-config-list");
   const usersSummary = byId("users-summary");
   const streamsPlaceholder = byId("streams-placeholder");
@@ -34,7 +33,6 @@
     !statusEl ||
     !nodeStatusEl ||
     !coordinatorInput ||
-    !globalPromptInput ||
     !maxTokensInput ||
     !temperatureInput ||
     !topPInput ||
@@ -43,7 +41,7 @@
     !cancelAllBtn ||
     !userForm ||
     !userIdInput ||
-    !userPromptOverrideInput ||
+    !userPromptInput ||
     !usersConfigList ||
     !usersSummary ||
     !streamsPlaceholder ||
@@ -67,6 +65,8 @@
   let refreshTimer = null;
   const users = new Map();
   const runs = new Map();
+  let runningNodeCount = 0;
+  const addUserBtn = byId("add-user-btn");
 
   const setStatus = (text) => {
     statusEl.textContent = text;
@@ -101,11 +101,20 @@
   };
 
   const effectivePrompt = (user) => {
-    const local = `${user.promptOverride || ""}`.trim();
-    if (local) {
-      return local;
+    return `${user.prompt || ""}`.trim();
+  };
+
+  const updateNodeGuard = () => {
+    const noNodes = runningNodeCount === 0;
+    startAllBtn.disabled = noNodes;
+    if (addUserBtn) addUserBtn.disabled = noNodes;
+    // Disable per-user Start buttons inside stream cards
+    userStreams.querySelectorAll(".start-user-btn").forEach((btn) => {
+      btn.disabled = noNodes;
+    });
+    if (noNodes) {
+      setStatus("No running nodes \u2013 join a node first");
     }
-    return `${globalPromptInput.value || ""}`.trim();
   };
 
   const updateLayoutSummary = () => {
@@ -113,6 +122,10 @@
     const totalUsers = users.size;
     usersSummary.textContent = `${totalUsers} configured user(s)`;
     streamsPlaceholder.style.display = totalUsers === 0 ? "block" : "none";
+    if (runningNodeCount === 0) {
+      setStatus("No running nodes \u2013 join a node first");
+      return;
+    }
     if (activeCount === 0) {
       setStatus(totalUsers > 0 ? `Ready (${totalUsers} users)` : "Idle");
       return;
@@ -172,9 +185,9 @@
     row.innerHTML = `
       <div class="user-config-head">
         <strong>${user.userId}</strong>
-        <span class="muted">Override Prompt</span>
+        <span class="muted">Prompt</span>
       </div>
-      <textarea class="user-prompt-edit" rows="2" placeholder="Optional prompt override"></textarea>
+      <textarea class="user-prompt-edit" rows="2" placeholder="Enter prompt"></textarea>
       <div class="user-config-actions">
         <button type="button" class="secondary focus-user-btn">Focus</button>
         <button type="button" class="secondary remove-user-btn">Remove</button>
@@ -182,7 +195,7 @@
     `;
     const promptEdit = row.querySelector(".user-prompt-edit");
     if (promptEdit) {
-      promptEdit.value = user.promptOverride;
+      promptEdit.value = user.prompt;
     }
     return row;
   };
@@ -216,7 +229,7 @@
     return card;
   };
 
-  const addUser = (userId, promptOverride = "") => {
+  const addUser = (userId, prompt = "") => {
     const normalized = `${userId}`.trim();
     if (!normalized) {
       setStatus("User ID is required");
@@ -229,7 +242,7 @@
 
     const user = {
       userId: normalized,
-      promptOverride: `${promptOverride || ""}`.trim(),
+      prompt: `${prompt || ""}`.trim(),
       activeRequestId: null,
       configRow: null,
       card: null,
@@ -442,6 +455,10 @@
     if (!user) {
       return;
     }
+    if (runningNodeCount === 0) {
+      setStatus("No running nodes \u2013 join a node first");
+      return;
+    }
     if (user.activeRequestId && runs.get(user.activeRequestId)?.active) {
       setStatus(`User ${user.userId} already has an active stream`);
       return;
@@ -602,7 +619,10 @@
       const payload = await res.json();
       const nodes = payload.nodes || [];
       renderNodes(nodes);
-      setNodeStatus(`${nodes.length} managed node(s)`);
+      runningNodeCount = nodes.filter((n) => n.running).length;
+      setNodeStatus(`${nodes.length} managed node(s), ${runningNodeCount} running`);
+      updateNodeGuard();
+      updateLayoutSummary();
     } catch (err) {
       setNodeStatus(`Node list error: ${err}`);
     }
@@ -672,8 +692,8 @@
   userForm.addEventListener("submit", (e) => {
     e.preventDefault();
     const userId = `${userIdInput.value || ""}`.trim();
-    const promptOverride = `${userPromptOverrideInput.value || ""}`.trim();
-    addUser(userId, promptOverride);
+    const prompt = `${userPromptInput.value || ""}`.trim();
+    addUser(userId, prompt);
     userForm.reset();
     userIdInput.focus();
   });
@@ -695,7 +715,7 @@
     if (!user) {
       return;
     }
-    user.promptOverride = target.value.trim();
+    user.prompt = target.value.trim();
     updateUserPromptPreview(user);
   });
 
@@ -752,6 +772,10 @@
   });
 
   startAllBtn.addEventListener("click", () => {
+    if (runningNodeCount === 0) {
+      setStatus("No running nodes \u2013 join a node first");
+      return;
+    }
     if (users.size === 0) {
       setStatus("Add at least one user first");
       return;
@@ -765,7 +789,7 @@
     await cancelAllRuns();
   });
 
-  globalPromptInput.addEventListener("input", refreshPromptPreviews);
+
   coordinatorInput.addEventListener("input", updateCliPreview);
 
   nodeForm.addEventListener("submit", async (e) => {

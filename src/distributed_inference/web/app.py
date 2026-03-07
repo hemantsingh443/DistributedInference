@@ -325,12 +325,16 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
     def health_fragment(request: Request):
         coordinator = request.app.state.default_coordinator
         with request.app.state.managed_nodes_lock:
-            managed_nodes = len(request.app.state.managed_nodes)
+            total = len(request.app.state.managed_nodes)
+            running = sum(
+                1 for m in request.app.state.managed_nodes.values()
+                if m.process.poll() is None
+            )
         return (
             "<span class='health-dot'></span>"
             "<span>Web ready</span>"
             f"<span class='muted'>Coordinator: {coordinator}</span>"
-            f"<span class='muted'>Managed nodes: {managed_nodes}</span>"
+            f"<span class='muted'>Nodes: {running}/{total} running</span>"
         )
 
     @app.get("/api/runs/{request_id}")
