@@ -1020,8 +1020,8 @@ class Orchestrator:
 
             all_hop_latencies = []
             generated_tokens = 0
-            # Initialize with decoded prompt to satisfy tests expecting full text
-            generated_text = self._tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            # Will be computed from full sequence buffer at completion
+            generated_text = ""
             total_time_ms = 0.0
             tokens_per_sec = 0.0
 
@@ -1136,7 +1136,6 @@ class Orchestrator:
                     token_text = self._tokenizer.decode(
                         [token_id], skip_special_tokens=False
                     )
-                    generated_text += token_text
                     
                     # Also use preallocated view for decode accumulated
                     accumulated_text = self._tokenizer.decode(
@@ -1216,7 +1215,6 @@ class Orchestrator:
                     generated_tokens += 1
                     token_id = int(next_token.item())
                     token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
-                    generated_text += token_text
                     
                     accumulated_text = self._tokenizer.decode(
                         input_ids_buffer[0, :current_idx+1], skip_special_tokens=True
@@ -1233,6 +1231,11 @@ class Orchestrator:
                         ),
                         **event_fields,
                     )
+
+            # Deriving final text from the full buffer ensures spaces are preserved by the tokenizer
+            if 'input_ids_buffer' in locals():
+                final_seq = input_ids_buffer[0, :initial_len + generated_tokens]
+                generated_text = self._tokenizer.decode(final_seq, skip_special_tokens=True)
 
             total_time_ms = (time.time() - start_time) * 1000
             tokens_per_sec = (generated_tokens / (total_time_ms / 1000)) if total_time_ms > 0 else 0
