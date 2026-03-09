@@ -1,4 +1,6 @@
 .pytest_cache 
 venv
 __pycache__ 
-distributed_inference.egg-info 
+distributed_inference.egg-info  
+bugs.md 
+reviews.md

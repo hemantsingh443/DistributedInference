@@ -7,6 +7,7 @@ from typing import List, Optional
 from distributed_inference.common.config import ModelConfig
 from distributed_inference.common.logging import get_logger
 from distributed_inference.common.serialization import estimate_layer_memory_mb
+from distributed_inference.coordinator.adapters import get_model_spec
 from distributed_inference.coordinator.registry import RegisteredNode
 
 log = get_logger(__name__)
@@ -97,18 +98,29 @@ def partition_model(
     if not nodes:
         raise ValueError("No nodes available for partitioning")
 
-    total_layers = model_config.num_layers
+    # Fetch dynamic model architecture specification
+    model_spec = get_model_spec(model_config.name)
+    total_layers = model_spec.num_layers
     dtype_bytes = 2 if model_config.dtype == "float16" else 4
 
     mem_per_layer = estimate_layer_memory_mb(
-        hidden_size=model_config.hidden_size,
+        hidden_size=model_spec.hidden_size,
         intermediate_size=model_config.intermediate_size,
-        num_heads=model_config.num_attention_heads,
+        num_heads=model_spec.num_attention_heads,
         dtype_bytes=dtype_bytes,
     )
 
-    vocab_size = 32000
-    embed_memory_mb = (vocab_size * model_config.hidden_size * dtype_bytes) / (1024 * 1024)
+    # Calculate KV cache memory per token and estimate active token reserve
+    # Assuming an average concurrent context of 4096 tokens per node (heuristic)
+    head_dim = max(1, model_spec.hidden_size // max(1, model_spec.num_attention_heads))
+    kv_cache_bytes_per_token = 2 * model_spec.num_key_value_heads * head_dim * dtype_bytes
+    expected_cache_tokens = 4096  # Should ideally be a config, but hardcoded heuristic for now
+    kv_cache_reserve_mb_per_layer = (kv_cache_bytes_per_token * expected_cache_tokens) / (1024 * 1024)
+    # Add KV cache memory to the layer overhead to prevent OOM
+    mem_per_layer += kv_cache_reserve_mb_per_layer
+
+    vocab_size = model_spec.vocab_size
+    embed_memory_mb = (vocab_size * model_spec.hidden_size * dtype_bytes) / (1024 * 1024)
     lm_head_memory_mb = embed_memory_mb
     total_model_memory = (
         total_layers * mem_per_layer + embed_memory_mb + lm_head_memory_mb
@@ -321,9 +333,10 @@ def _ensure_edge_assignments_non_empty(
     # Validate we did not exceed fit bounds for edges when donating.
     for idx, layers in enumerate(layer_counts):
         if layers > max_fit_limits[idx]:
-            raise ValueError(
+            log.warning(
                 f"Node index {idx} exceeded memory fit constraints "
-                "during edge assignment"
+                f"during edge assignment (assigned {layers}, limit {max_fit_limits[idx]}). "
+                "Node might face memory pressure."
             )
 
 

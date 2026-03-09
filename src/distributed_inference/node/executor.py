@@ -29,6 +29,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from transformers import AutoModelForCausalLM, AutoConfig
 
 from distributed_inference.common.logging import get_logger
+from distributed_inference.coordinator.adapters import get_model_spec, ModelSpec
 from distributed_inference.node.resources import get_device, get_vram_usage_mb
 
 log = get_logger(__name__)
@@ -81,6 +82,7 @@ class ShardExecutor:
 
     @staticmethod
     def _get_shard_weight_keys(
+        model_spec: ModelSpec,
         start_layer: int,
         end_layer: int,
         has_embedding: bool,
@@ -89,22 +91,24 @@ class ShardExecutor:
         """Build the set of weight-key prefixes this shard needs."""
         prefixes: set[str] = set()
         for i in range(start_layer, end_layer):
-            prefixes.add(f"model.layers.{i}.")
+            prefixes.add(f"{model_spec.layer_prefix}{i}.")
         if has_embedding:
-            prefixes.add("model.embed_tokens.")
+            prefixes.add(model_spec.embed_prefix)
         if has_lm_head:
-            prefixes.add("lm_head.")
-            prefixes.add("model.norm.")
+            prefixes.add(model_spec.lm_head_prefix)
+            if model_spec.final_norm_prefix:
+                prefixes.add(model_spec.final_norm_prefix)
         return prefixes
 
     @staticmethod
-    def _remap_layer_key(key: str, start_layer: int) -> str:
+    def _remap_layer_key(key: str, start_layer: int, model_spec: ModelSpec) -> str:
         """Remap a full-model weight key to local shard indices.
 
         E.g. ``model.layers.15.self_attn.q_proj.weight`` with
         start_layer=15 becomes ``model.layers.0.self_attn.q_proj.weight``.
         """
-        m = re.match(r"^(model\.layers\.)(\d+)(\..*)", key)
+        pattern = rf"^({re.escape(model_spec.layer_prefix)})(\d+)(\..*)"
+        m = re.match(pattern, key)
         if m:
             original_idx = int(m.group(2))
             local_idx = original_idx - start_layer
@@ -203,10 +207,14 @@ class ShardExecutor:
         # Load model config and create an empty model shell with only
         # the number of layers this shard needs.
         self.model_config = AutoConfig.from_pretrained(model_name)
+        model_spec = get_model_spec(model_name)
         num_layers = end_layer - start_layer
 
-        original_num_layers = self.model_config.num_hidden_layers
-        self.model_config.num_hidden_layers = num_layers
+        original_num_layers = getattr(self.model_config, "num_hidden_layers", getattr(self.model_config, "n_layer", 0))
+        if hasattr(self.model_config, "num_hidden_layers"):
+            self.model_config.num_hidden_layers = num_layers
+        elif hasattr(self.model_config, "n_layer"):
+            self.model_config.n_layer = num_layers
         self.model_config.use_cache = True
 
         torch_dtype = torch.float16 if dtype == "float16" else torch.float32
@@ -218,7 +226,7 @@ class ShardExecutor:
 
         # Determine which weight prefixes this shard needs
         needed_prefixes = self._get_shard_weight_keys(
-            start_layer, end_layer, has_embedding, has_lm_head
+            model_spec, start_layer, end_layer, has_embedding, has_lm_head
         )
 
         # Resolve which safetensor files contain the needed weights
@@ -231,7 +239,7 @@ class ShardExecutor:
             file_tensors = safetensors_load_file(shard_path, device="cpu")
             for orig_key, tensor in file_tensors.items():
                 if any(orig_key.startswith(p) for p in needed_prefixes):
-                    remapped_key = self._remap_layer_key(orig_key, start_layer)
+                    remapped_key = self._remap_layer_key(orig_key, start_layer, model_spec)
                     state_dict[remapped_key] = tensor.to(torch_dtype)
             del file_tensors
 
@@ -244,10 +252,11 @@ class ShardExecutor:
             log.warning(f"Unexpected keys during shard load: {unexpected[:5]}")
         expected_missing = set()
         if not has_embedding:
-            expected_missing.add("model.embed_tokens.weight")
+            expected_missing.add(f"{model_spec.embed_prefix}weight")
         if not has_lm_head:
-            expected_missing.add("lm_head.weight")
-            expected_missing.add("model.norm.weight")
+            expected_missing.add(f"{model_spec.lm_head_prefix}weight")
+            if model_spec.final_norm_prefix:
+                expected_missing.add(f"{model_spec.final_norm_prefix}weight")
         real_missing = [k for k in missing if k not in expected_missing]
         if real_missing:
             log.warning(
