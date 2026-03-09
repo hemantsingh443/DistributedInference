@@ -52,6 +52,7 @@ class RegisteredNode:
     active_requests: int = 0
     queue_depth: int = 0
     estimated_free_vram_mb: int = 0
+    recovery_heartbeats: int = 0
     registered_at: float = field(default_factory=time.time)
 
 
@@ -187,12 +188,22 @@ class NodeRegistry:
                 node.active_requests = active_requests
                 node.queue_depth = queue_depth
                 node.estimated_free_vram_mb = estimated_free_vram_mb
+                
+                # Bug 6 Fix: Node Flapping (Hysteresis)
+                # Require 3 consecutive stable heartbeats before trusting a recovering
+                # node enough to flip its state back to READY and trigger a rebalance.
                 if node.state in (NodeState.SUSPECT, NodeState.DEAD):
-                    previous_state = node.state
-                    node.state = NodeState.READY
-                    log.info(
-                        f"Node {node_id} recovered from {previous_state.value} state"
-                    )
+                    node.recovery_heartbeats += 1
+                    if node.recovery_heartbeats >= 3:
+                        previous_state = node.state
+                        node.state = NodeState.READY
+                        node.recovery_heartbeats = 0
+                        log.info(
+                            f"Node {node_id} recovered from {previous_state.value} state "
+                            f"after showing stable heartbeats."
+                        )
+                else:
+                    node.recovery_heartbeats = 0
 
     def increment_missed_heartbeats(self, node_id: str) -> int:
         """Increment heartbeat miss counter and return the updated value."""

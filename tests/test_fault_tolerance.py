@@ -130,6 +130,8 @@ class TestNodeRegistry:
         assert node.state == NodeState.SUSPECT
 
         registry.update_heartbeat("node-1")
+        registry.update_heartbeat("node-1")
+        registry.update_heartbeat("node-1")
         node = registry.get_node("node-1")
         assert node.state == NodeState.READY
 
@@ -139,6 +141,8 @@ class TestNodeRegistry:
         registry.mark_dead("node-1")
         assert registry.get_node("node-1").state == NodeState.DEAD
 
+        registry.update_heartbeat("node-1")
+        registry.update_heartbeat("node-1")
         registry.update_heartbeat("node-1")
         node = registry.get_node("node-1")
         assert node.state == NodeState.READY

@@ -242,18 +242,30 @@ class ConcurrentRequestScheduler:
                         )
                         continue
 
-                    if not self._capacity_available_locked(pending.execution_plan):
+                    # Bug 5 Fix: Scheduler Deadlock
+                    # _capacity_available_locked now returns (is_capable, is_busy).
+                    # 'is_capable' means the node has physical VRAM and exists. 
+                    # 'is_busy' means it's capable but currently saturated with active requests.
+                    is_capable, is_busy = self._capacity_available_locked(pending.execution_plan)
+                    
+                    if not is_capable:
                         pending.dispatch_retries += 1
                         if pending.dispatch_retries > self.max_retry_attempts:
                             self._drop_pending_locked(
                                 pending,
                                 error=(
-                                    "Coordinator overloaded: insufficient node capacity, "
+                                    "Coordinator overloaded: insufficient physical node capacity, "
                                     f"retry_after_ms={int(self.retry_backoff_sec * 1000)}"
                                 ),
                             )
                         else:
                             pending.next_eligible_at = now + self.retry_backoff_sec
+                        continue
+                        
+                    if is_busy:
+                        # Soft failure: keep the request in the queue without incrementing retries,
+                        # effectively waiting for active requests to finish and free up lanes.
+                        pending.next_eligible_at = now + self.retry_backoff_sec
                         continue
 
                     self._remove_pending_locked(pending)
@@ -306,21 +318,23 @@ class ConcurrentRequestScheduler:
                     return pending
         return None
 
-    def _capacity_available_locked(self, execution_plan: ExecutionPlan) -> bool:
+    def _capacity_available_locked(self, execution_plan: ExecutionPlan) -> tuple[bool, bool]:
+        """Check if nodes have capacity. Returns (is_capable, is_busy)."""
+        is_busy = False
         for stage in execution_plan.stages:
             node = self.registry.get_node(stage.node_id)
             if node is None:
-                return False
+                return False, False # Not capable
 
             lane_cap = self.node_max_concurrent_lanes
             if node.active_requests >= lane_cap:
-                return False
+                is_busy = True # Capable but soft busy!
 
             reserve_fraction = max(0.0, 1.0 - self.per_node_vram_safety_margin)
             reserve_mb = node.vram_mb * reserve_fraction
             if node.estimated_free_vram_mb > 0 and node.estimated_free_vram_mb < reserve_mb:
-                return False
-        return True
+                return False, False # Not capable (OOM danger)
+        return True, is_busy
 
     def _emit_metrics_locked(self) -> None:
         # Intentionally avoid callback invocation while scheduler lock is held.

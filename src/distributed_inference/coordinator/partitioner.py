@@ -321,12 +321,38 @@ def _ensure_edge_assignments_non_empty(
 
     first_idx = 0
     last_idx = len(layer_counts) - 1
+    
+    # Bug 3 Fix: Edge-Case Crash on Tiny Models against Large Clusters
+    # We must mathematically ensure there are enough layers total to satisfy 
+    # the constraint (1 for first node, 1 for last node = 2 total minimum).
+    total_assigned = sum(layer_counts)
+    if total_assigned < 2:
+        raise ValueError(
+            f"Cannot strictly satisfy pipeline edges: model demands {total_assigned} "
+            f"layers total, but cluster has {len(layer_counts)} nodes requiring at "
+            "least 1 head and 1 tail embedding node. Reduce node pool or increase model size."
+        )
+
+    # Resolve first index
     if layer_counts[first_idx] <= 0:
-        donor_idx = _find_donor(layer_counts, exclude={first_idx})
+        # Prevent stealing from the last node if it only has 1 layer, otherwise we
+        # break its edge requirement instantly.
+        exclude = {first_idx}
+        if layer_counts[last_idx] == 1:
+            exclude.add(last_idx)
+            
+        donor_idx = _find_donor(layer_counts, exclude=exclude)
         layer_counts[donor_idx] -= 1
         layer_counts[first_idx] += 1
+        
+    # Resolve last index
     if layer_counts[last_idx] <= 0:
-        donor_idx = _find_donor(layer_counts, exclude={last_idx})
+        # Same protection: don't immediately steal the layer we *just* gave to first_idx
+        exclude = {last_idx}
+        if layer_counts[first_idx] == 1:
+            exclude.add(first_idx)
+            
+        donor_idx = _find_donor(layer_counts, exclude=exclude)
         layer_counts[donor_idx] -= 1
         layer_counts[last_idx] += 1
 
@@ -345,5 +371,5 @@ def _find_donor(layer_counts: List[int], exclude: set[int]) -> int:
     if not candidates:
         candidates = [i for i, c in enumerate(layer_counts) if i not in exclude and c > 0]
     if not candidates:
-        raise ValueError("Unable to rebalance edge assignments: no donor node available")
+        raise ValueError(f"Unable to rebalance edge assignments: no donor node available (exclude={exclude}, counts={layer_counts})")
     return max(candidates, key=lambda i: layer_counts[i])

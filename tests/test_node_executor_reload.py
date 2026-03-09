@@ -4,6 +4,19 @@ import torch
 import torch.nn as nn
 
 from distributed_inference.node.executor import ShardExecutor
+from distributed_inference.coordinator.adapters import ModelSpec
+
+DEFAULT_LLAMA_SPEC = ModelSpec(
+    num_layers=32,
+    hidden_size=4096,
+    num_attention_heads=32,
+    num_key_value_heads=32,
+    vocab_size=32000,
+    layer_prefix="model.layers.",
+    embed_prefix="model.embed_tokens.",
+    final_norm_prefix="model.norm.",
+    lm_head_prefix="lm_head."
+)
 
 
 class _DummyInnerModel(nn.Module):
@@ -66,6 +79,10 @@ def test_load_shard_unloads_previous_model_before_reload(monkeypatch):
         "distributed_inference.node.executor.get_vram_usage_mb",
         lambda: 0,
     )
+    monkeypatch.setattr(
+        "distributed_inference.node.executor.get_model_spec",
+        lambda _n: DEFAULT_LLAMA_SPEC,
+    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     _ = executor.load_shard(
@@ -84,6 +101,7 @@ def test_load_shard_unloads_previous_model_before_reload(monkeypatch):
 def test_selective_weight_key_prefixes():
     """Verify _get_shard_weight_keys returns correct prefixes."""
     keys = ShardExecutor._get_shard_weight_keys(
+        model_spec=DEFAULT_LLAMA_SPEC,
         start_layer=3, end_layer=6,
         has_embedding=True, has_lm_head=False,
     )
@@ -99,6 +117,7 @@ def test_selective_weight_key_prefixes():
 def test_selective_weight_key_prefixes_lm_head():
     """Verify lm_head prefixes are included when has_lm_head=True."""
     keys = ShardExecutor._get_shard_weight_keys(
+        model_spec=DEFAULT_LLAMA_SPEC,
         start_layer=10, end_layer=12,
         has_embedding=False, has_lm_head=True,
     )
@@ -112,18 +131,18 @@ def test_selective_weight_key_prefixes_lm_head():
 def test_remap_layer_key():
     """Verify layer index remapping in weight keys."""
     assert ShardExecutor._remap_layer_key(
-        "model.layers.15.self_attn.q_proj.weight", start_layer=15
+        "model.layers.15.self_attn.q_proj.weight", start_layer=15, model_spec=DEFAULT_LLAMA_SPEC
     ) == "model.layers.0.self_attn.q_proj.weight"
 
     assert ShardExecutor._remap_layer_key(
-        "model.layers.3.mlp.gate_proj.weight", start_layer=2
+        "model.layers.3.mlp.gate_proj.weight", start_layer=2, model_spec=DEFAULT_LLAMA_SPEC
     ) == "model.layers.1.mlp.gate_proj.weight"
 
     # Non-layer keys should pass through unchanged
     assert ShardExecutor._remap_layer_key(
-        "model.embed_tokens.weight", start_layer=5
+        "model.embed_tokens.weight", start_layer=5, model_spec=DEFAULT_LLAMA_SPEC
     ) == "model.embed_tokens.weight"
 
     assert ShardExecutor._remap_layer_key(
-        "lm_head.weight", start_layer=5
+        "lm_head.weight", start_layer=5, model_spec=DEFAULT_LLAMA_SPEC
     ) == "lm_head.weight"

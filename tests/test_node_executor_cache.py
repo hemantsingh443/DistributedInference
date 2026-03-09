@@ -115,17 +115,18 @@ def test_lru_eviction_when_max_cached_requests_exceeded():
         is_prefill=True,
         cache_position=1,
     )
-    _ = executor.forward(
-        hidden_states=torch.randn(1, 2, 4),
-        request_id="req-b",
-        use_cache=True,
-        reset_cache=True,
-        is_prefill=True,
-        cache_position=1,
-    )
+    with pytest.raises(RuntimeError, match="KV Cache capacity exceeded"):
+        _ = executor.forward(
+            hidden_states=torch.randn(1, 2, 4),
+            request_id="req-b",
+            use_cache=True,
+            reset_cache=True,
+            is_prefill=True,
+            cache_position=1,
+        )
 
-    assert "req-a" not in executor._kv_cache_by_request
-    assert "req-b" in executor._kv_cache_by_request
+    assert "req-a" in executor._kv_cache_by_request
+    assert "req-b" not in executor._kv_cache_by_request
 
 
 def test_renumber_layer_indices_for_sliced_layers():

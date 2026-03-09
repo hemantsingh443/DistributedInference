@@ -550,8 +550,13 @@ class ShardExecutor:
             if request_id in self._kv_cache_by_request:
                 self._kv_cache_by_request.move_to_end(request_id)
             elif len(self._kv_cache_by_request) >= self.max_cached_requests:
-                evicted_id, _ = self._kv_cache_by_request.popitem(last=False)
-                log.warning(f"Evicted KV cache for request {evicted_id} (LRU)")
+                # Bug 9 Fix: LRU Cache Eviction Data Loss
+                # Instead of silently popping an active user's cache, we throw a loud error
+                # because the Server Admission Control should have prevented this request.
+                raise RuntimeError(
+                    f"KV Cache capacity exceeded ({self.max_cached_requests}). "
+                    f"Server admission control failed to prevent prefill for {request_id}."
+                )
 
             self._kv_cache_by_request[request_id] = CacheEntry(
                 past_key_values=past_key_values,

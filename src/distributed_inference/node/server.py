@@ -137,11 +137,36 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                     context.set_details(f"request {request_id} was cancelled")
                 return inference_pb2.ActivationData()
 
+        # Bug 9 Fix: LRU Cache Eviction Data Loss (Admission Control)
+        # Prevent the node from taking on more NEW requests than it can physically cache,
+        # which would force it to silently evict and destroy generation state for active users.
+        if request.is_prefill and request.use_cache:
+            with self.executor._cache_lock:
+                current_cache_count = len(self.executor._kv_cache_by_request)
+            if current_cache_count >= self.executor.max_cached_requests:
+                if context is not None:
+                    context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+                    context.set_details(
+                        f"node KV cache slots are full ({current_cache_count}/{self.executor.max_cached_requests})"
+                    )
+                return inference_pb2.ActivationData()
+
         if not self._try_acquire_lane():
             if context is not None:
                 context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
                 context.set_details("node forward lanes are saturated")
             return inference_pb2.ActivationData()
+
+        # Bug 7 Fix: Thread Starvation
+        # Re-check cancellation AFTER bridging the semaphore. If was cancelled while waiting,
+        # immediately drop it rather than processing the heavy PyTorch forward pass.
+        with self._status_lock:
+            if request_id and request_id in self._cancelled_requests:
+                self._release_lane()
+                if context is not None:
+                    context.set_code(grpc.StatusCode.CANCELLED)
+                    context.set_details(f"request {request_id} was cancelled while in queue")
+                return inference_pb2.ActivationData()
 
         try:
             # Deserialize input tensors
@@ -187,11 +212,22 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 f"time={elapsed_ms:.1f}ms"
             )
 
+            # Bug 10 Fix: Explicit Tensor Memory Deallocation
+            # Python's GC is often too slow to drop these references implicitly before the 
+            # gRPC Servicer thread ends, meaning the next request hits OOM on the CUDA allocator. 
+            # We explicitly destroy the python references linking to the C++ graphical engine now.
+            output_shape = list(output.shape)
+            output_dtype = str(output.dtype).replace("torch.", "")
+            del hidden_states
+            del attention_mask
+            del position_ids
+            del output
+
             return inference_pb2.ActivationData(
                 hidden_states=inference_pb2.TensorData(
                     data=output_bytes,
-                    shape=list(output.shape),
-                    dtype=str(output.dtype).replace("torch.", ""),
+                    shape=output_shape,
+                    dtype=output_dtype,
                 ),
                 attention_mask=request.attention_mask,  # Pass through
                 position_ids=request.position_ids,  # Pass through

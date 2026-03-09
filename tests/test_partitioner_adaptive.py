@@ -1,8 +1,12 @@
 """Tests for compute-aware partitioning behavior."""
 
+import pytest
+from unittest.mock import patch
+
 from distributed_inference.common.config import ModelConfig
 from distributed_inference.coordinator.partitioner import partition_model
 from distributed_inference.coordinator.registry import RegisteredNode
+from distributed_inference.coordinator.adapters import ModelSpec
 
 
 def _node(
@@ -36,6 +40,22 @@ def _model() -> ModelConfig:
         num_attention_heads=32,
         num_kv_heads=4,
     )
+
+@pytest.fixture(autouse=True)
+def mock_model_spec():
+    with patch("distributed_inference.coordinator.partitioner.get_model_spec") as mock:
+        mock.return_value = ModelSpec(
+            num_layers=22,
+            hidden_size=2048,
+            num_attention_heads=32,
+            num_key_value_heads=4,
+            vocab_size=32000,
+            layer_prefix="model.layers.",
+            embed_prefix="model.embed_tokens.",
+            final_norm_prefix="model.norm.",
+            lm_head_prefix="lm_head."
+        )
+        yield mock
 
 
 def test_partition_model_is_deterministic() -> None:

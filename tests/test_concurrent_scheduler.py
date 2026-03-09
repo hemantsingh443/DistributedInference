@@ -153,9 +153,9 @@ def test_queue_overflow_returns_retry_hint():
     scheduler.stop()
 
 
-def test_capacity_retries_then_rejects_with_retry_after():
+def test_capacity_queues_and_waits_for_lane_to_free():
     registry = _build_registry()
-    # Saturate node lane capacity so scheduler cannot dispatch.
+    # Saturate node lane capacity so scheduler cannot dispatch initially.
     registry.update_heartbeat(
         node_id="node-1",
         vram_used_mb=100,
@@ -174,11 +174,38 @@ def test_capacity_retries_then_rejects_with_retry_after():
     )
     plan = _build_execution_plan()
 
-    with pytest.raises(RuntimeError, match="retry_after_ms"):
-        scheduler.acquire(
+    gate = threading.Event()
+    acquired_ticket = []
+
+    def _requester():
+        ticket = scheduler.acquire(
             request_id="req-capacity",
             user_id="user",
             execution_plan=plan,
             cancel_event=threading.Event(),
         )
+        acquired_ticket.append(ticket)
+        gate.set()
+
+    t = threading.Thread(target=_requester, daemon=True)
+    t.start()
+
+    # Wait a bit to ensure it's blocked in the queue due to node saturation
+    time.sleep(0.5)
+    assert not gate.is_set()
+
+    # Free up the node lane
+    registry.update_heartbeat(
+        node_id="node-1",
+        vram_used_mb=100,
+        active_requests=0,
+        queue_depth=0,
+        estimated_free_vram_mb=1900,
+    )
+
+    # Now it should be able to acquire
+    gate.wait(timeout=2.0)
+    assert gate.is_set()
+    assert acquired_ticket[0].request_id == "req-capacity"
+
     scheduler.stop()

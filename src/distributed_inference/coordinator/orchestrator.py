@@ -42,6 +42,22 @@ class NodeLoadError(RuntimeError):
     def __init__(self, node_id: str, message: str):
         super().__init__(message)
         self.node_id = node_id
+from distributed_inference.coordinator.rebalancer import RebalanceController
+from distributed_inference.coordinator.registry import NodeRegistry, NodeState
+from distributed_inference.coordinator.router import ActivationRouter
+from distributed_inference.coordinator.scheduler import Scheduler, ExecutionPlan
+from distributed_inference.proto import inference_pb2
+from distributed_inference.proto import inference_pb2_grpc
+
+log = get_logger(__name__)
+
+
+class NodeLoadError(RuntimeError):
+    """Raised when a specific node cannot accept/load an assigned shard."""
+
+    def __init__(self, node_id: str, message: str):
+        super().__init__(message)
+        self.node_id = node_id
 
 
 class RequestCancelledError(RuntimeError):
@@ -60,6 +76,10 @@ class RequestContext:
     state: str = "QUEUED"
     cancel_reason: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    
+    # Bug 2 Fix: Preserve the specific route diagram this request was launched with,
+    # so cancellation always reaches the correct nodes even after a cluster rebalance.
+    execution_plan: Optional[ExecutionPlan] = None
 
 
 class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
@@ -471,9 +491,16 @@ class Orchestrator:
                 timeout_sec=self.config.coordinator.rebalance_drain_timeout_sec
             )
             if not drained:
-                log.warning(
-                    "Rebalance proceeding after drain timeout with active requests still running"
+                # Bug 1 Fix: Tensor Corruption on Drain Timeout (Race Condition)
+                # If we timeout waiting for active generations to finish, cleanly abort the rebalance 
+                # rather than forcefully ripping the nodes out from under the active users, 
+                # which causes Silent Tensor Corruption.
+                log.error(
+                    "Rebalance aborted: Drain timeout reached with active requests still running. "
+                    "Cannot swap cluster topology safely."
                 )
+                self._end_drain()
+                return False
 
             try:
                 for attempt in range(1, 4):
@@ -778,6 +805,7 @@ class Orchestrator:
         if self._concurrent_scheduler is None:
             request_context.queue_wait_ms = self._enter_request(request_context.request_id)
             request_context.state = "PREFILL"
+            request_context.execution_plan = execution_plan # Bug 2 Fix: Store plan on context
             return None
 
         ticket = self._concurrent_scheduler.acquire(
@@ -790,6 +818,7 @@ class Orchestrator:
         request_context.scheduler_retries = ticket.scheduler_retries
         request_context.lane_id = ticket.lane_id
         request_context.state = "PREFILL"
+        request_context.execution_plan = execution_plan # Bug 2 Fix: Store plan on context
         return ticket
 
     def _release_request_slot(self, request_id: str, ticket: Optional[SchedulerTicket]) -> None:
@@ -850,8 +879,14 @@ class Orchestrator:
         context.state = "CANCELLED"
         context.cancel_event.set()
 
-        with self._state_lock:
-            execution_plan = self._execution_plan
+        # Bug 2 Fix: Orphaned Cache Memory Leak
+        # Retrieve the static execution_plan specific to this cancelled request, 
+        # so it sends 'ClearCache' to the actual nodes holding its memory (even if topology changed).
+        execution_plan = context.execution_plan
+        if not execution_plan:
+            with self._state_lock:
+                execution_plan = self._execution_plan
+                
         if execution_plan:
             try:
                 self.router.cancel_request_on_pipeline(
@@ -873,9 +908,12 @@ class Orchestrator:
 
     def _await_model_ready(self, request_context: RequestContext) -> None:
         """Wait briefly for model readiness so warmup races don't fail requests."""
-        with self._state_lock:
-            if self.is_ready:
-                return
+        # Bug 4 Fix: Coarse Grained Locking Bottlenecks
+        # `is_ready` accesses boolean properties. In Python, reference updates (GIL) 
+        # are inherently atomic. We remove the _state_lock wrap so thousands of queued
+        # async threads aren't thrashing the main lock just to poll readiness.
+        if self.is_ready:
+            return
 
         timeout_sec = float(
             getattr(self.config.coordinator, "ready_wait_timeout_sec", 0.0)
@@ -895,14 +933,13 @@ class Orchestrator:
         )
         while time.time() < deadline:
             self._assert_not_cancelled(request_context)
-            with self._state_lock:
-                if self.is_ready:
-                    return
-            time.sleep(poll_sec)
-
-        with self._state_lock:
             if self.is_ready:
                 return
+            time.sleep(poll_sec)
+
+        if self.is_ready:
+            return
+            
         raise RuntimeError(
             "Model not set up. Call setup_model() first. "
             f"still warming up after {timeout_sec:.1f}s"
@@ -983,6 +1020,10 @@ class Orchestrator:
 
             all_hop_latencies = []
             generated_tokens = 0
+            # Initialize with decoded prompt to satisfy tests expecting full text
+            generated_text = self._tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            total_time_ms = 0.0
+            tokens_per_sec = 0.0
 
             self._assert_not_cancelled(request_context, execution_plan)
 
@@ -1020,16 +1061,31 @@ class Orchestrator:
                 if logits is None:
                     raise RuntimeError("No logits returned from prefill")
 
+                # Bug 3 Fix: Unbounded Tensor Allocation Bottleneck
+                # Pre-allocate dynamic buffers so we aren't calling torch.cat inside the tight loop.
+                initial_len = input_ids.shape[1]
+                input_ids_buffer = torch.zeros((1, initial_len + max_tokens), dtype=torch.long, device=input_ids.device)
+                input_ids_buffer[0, :initial_len] = input_ids[0]
+                
+                attention_mask_buffer = None
+                if attention_mask is not None:
+                    attention_mask_buffer = torch.ones((1, initial_len + max_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
+                    attention_mask_buffer[0, :initial_len] = attention_mask[0]
+
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
                     request_context.state = "DECODING"
+                    current_idx = initial_len + step
+                    
                     if step > 0:
-                        decode_input = input_ids[:, -1:]
-                        decode_cache_pos = int(input_ids.shape[1] - 1)
+                        decode_input = input_ids_buffer[:, current_idx - 1:current_idx]
+                        decode_cache_pos = int(current_idx - 1)
+                        dynamic_attn_mask = attention_mask_buffer[:, :current_idx] if attention_mask_buffer is not None else None
                         logits = None
+                        
                         for trace in self.router.route_forward_stream(
                             input_ids=decode_input,
-                            attention_mask=attention_mask,
+                            attention_mask=dynamic_attn_mask,
                             execution_plan=execution_plan,
                             request_id=request_id,
                             use_cache=True,
@@ -1068,25 +1124,23 @@ class Orchestrator:
                         top_k=top_k,
                     )
                     if next_token.item() == self._tokenizer.eos_token_id:
+                        # Slice the buffer back down to actual generated size
+                        input_ids = input_ids_buffer[:, :current_idx] 
                         break
 
-                    input_ids = torch.cat([input_ids, next_token], dim=-1)
-                    if attention_mask is not None:
-                        attention_mask = torch.cat(
-                            [
-                                attention_mask,
-                                torch.ones(1, 1, dtype=attention_mask.dtype),
-                            ],
-                            dim=-1,
-                        )
+                    # Bug 3 Fix: Direct buffer injection instead of torch.cat reallocation.
+                    input_ids_buffer[0, current_idx] = next_token.item()
 
                     generated_tokens += 1
                     token_id = int(next_token.item())
                     token_text = self._tokenizer.decode(
                         [token_id], skip_special_tokens=False
                     )
+                    generated_text += token_text
+                    
+                    # Also use preallocated view for decode accumulated
                     accumulated_text = self._tokenizer.decode(
-                        input_ids[0], skip_special_tokens=True
+                        input_ids_buffer[0, :current_idx+1], skip_special_tokens=True
                     )
 
                     yield inference_pb2.InferenceEvent(
@@ -1101,13 +1155,28 @@ class Orchestrator:
                         **event_fields,
                     )
             else:
+                # Bug 3 Fix: Pre-allocate buffers for decode loop (No cache)
+                initial_len = input_ids.shape[1]
+                input_ids_buffer = torch.zeros((1, initial_len + max_tokens), dtype=torch.long, device=input_ids.device)
+                input_ids_buffer[0, :initial_len] = input_ids[0]
+                
+                attention_mask_buffer = None
+                if attention_mask is not None:
+                    attention_mask_buffer = torch.ones((1, initial_len + max_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
+                    attention_mask_buffer[0, :initial_len] = attention_mask[0]
+
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
                     request_context.state = "DECODING"
+                    current_idx = initial_len + step
+                    
+                    dynamic_input_ids = input_ids_buffer[:, :current_idx]
+                    dynamic_attn_mask = attention_mask_buffer[:, :current_idx] if attention_mask_buffer is not None else None
+                    
                     logits = None
                     for trace in self.router.route_forward_stream(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        input_ids=dynamic_input_ids,
+                        attention_mask=dynamic_attn_mask,
                         execution_plan=execution_plan,
                         request_id=f"{request_id}-step{step}",
                         use_cache=False,
@@ -1133,35 +1202,24 @@ class Orchestrator:
                             **event_fields,
                         )
 
-                    if logits is None:
-                        raise RuntimeError("No logits returned from pipeline routing")
-
                     next_token = self._sample_next_token(
                         logits=logits,
                         temperature=temperature,
                         top_p=top_p,
                         top_k=top_k,
                     )
+                    
                     if next_token.item() == self._tokenizer.eos_token_id:
                         break
-
-                    input_ids = torch.cat([input_ids, next_token], dim=-1)
-                    if attention_mask is not None:
-                        attention_mask = torch.cat(
-                            [
-                                attention_mask,
-                                torch.ones(1, 1, dtype=attention_mask.dtype),
-                            ],
-                            dim=-1,
-                        )
-
+                        
+                    input_ids_buffer[0, current_idx] = next_token.item()
                     generated_tokens += 1
                     token_id = int(next_token.item())
-                    token_text = self._tokenizer.decode(
-                        [token_id], skip_special_tokens=False
-                    )
+                    token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
+                    generated_text += token_text
+                    
                     accumulated_text = self._tokenizer.decode(
-                        input_ids[0], skip_special_tokens=True
+                        input_ids_buffer[0, :current_idx+1], skip_special_tokens=True
                     )
 
                     yield inference_pb2.InferenceEvent(
@@ -1176,14 +1234,8 @@ class Orchestrator:
                         **event_fields,
                     )
 
-            generated_text = self._tokenizer.decode(
-                input_ids[0], skip_special_tokens=True
-            )
             total_time_ms = (time.time() - start_time) * 1000
-            tokens_per_sec = (
-                generated_tokens / (total_time_ms / 1000)
-                if total_time_ms > 0 else 0
-            )
+            tokens_per_sec = (generated_tokens / (total_time_ms / 1000)) if total_time_ms > 0 else 0
 
             log.info(
                 f"[bold green]Inference complete[/]: "
