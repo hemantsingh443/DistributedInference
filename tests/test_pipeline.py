@@ -15,7 +15,7 @@ class TestPipelineBasic:
         """Test that default config loads correctly."""
         from distributed_inference.common.config import load_config
         config = load_config()
-        assert config.model.name == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        assert config.model.name == "Qwen/Qwen2-0.5B-Instruct"
         assert config.model.num_layers == 22
         assert config.coordinator.port == 50050
 

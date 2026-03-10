@@ -98,6 +98,8 @@ class ShardExecutor:
             prefixes.add(model_spec.lm_head_prefix)
             if model_spec.final_norm_prefix:
                 prefixes.add(model_spec.final_norm_prefix)
+            if getattr(model_spec, "tie_word_embeddings", False):
+                prefixes.add(model_spec.embed_prefix)
         return prefixes
 
     @staticmethod
@@ -251,7 +253,8 @@ class ShardExecutor:
         if unexpected:
             log.warning(f"Unexpected keys during shard load: {unexpected[:5]}")
         expected_missing = set()
-        if not has_embedding:
+        needs_embed = has_embedding or (has_lm_head and getattr(model_spec, "tie_word_embeddings", False))
+        if not needs_embed:
             expected_missing.add(f"{model_spec.embed_prefix}weight")
         if not has_lm_head:
             expected_missing.add(f"{model_spec.lm_head_prefix}weight")

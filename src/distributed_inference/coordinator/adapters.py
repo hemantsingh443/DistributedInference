@@ -27,6 +27,7 @@ class ModelSpec:
     embed_prefix: str
     final_norm_prefix: str
     lm_head_prefix: str
+    tie_word_embeddings: bool
 
 
 def get_model_spec(model_name: str) -> ModelSpec:
@@ -55,6 +56,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
     num_attention_heads = getattr(config, "num_attention_heads", getattr(config, "n_head", 0))
     # KV heads might be less than attention heads in GQA architectures
     num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
+    tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
 
     if num_layers == 0 or num_attention_heads == 0:
         raise ValueError(f"Could not extract layer/head counts from config for {model_name}")
@@ -69,6 +71,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
         embed_prefix="",
         final_norm_prefix="",
         lm_head_prefix="",
+        tie_word_embeddings=tie_word_embeddings,
     )
 
     # Route weight key prefixes by architecture

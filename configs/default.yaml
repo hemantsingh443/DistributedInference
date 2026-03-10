@@ -1,7 +1,7 @@
 # Distributed Inference System — Default Configuration
 
 model:
-  name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  name: "Qwen/Qwen2-0.5B-Instruct"
   dtype: "float16"
   num_layers: 22
   hidden_size: 2048

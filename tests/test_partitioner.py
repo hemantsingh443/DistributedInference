@@ -45,7 +45,8 @@ def mock_model_spec():
             layer_prefix="model.layers.",
             embed_prefix="model.embed_tokens.",
             final_norm_prefix="model.norm.",
-            lm_head_prefix="lm_head."
+            lm_head_prefix="lm_head.",
+            tie_word_embeddings=False
         )
         yield mock
 
