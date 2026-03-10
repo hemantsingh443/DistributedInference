@@ -1,8 +1,8 @@
 # Distributed Inference System
 
-A prototype distributed inference system where multiple nodes collaboratively run forward-pass inference on a sharded LLM (TinyLlama 1.1B). Designed to validate dynamic model partitioning, measure communication overhead, and test fault tolerance.
+A prototype distributed inference system where multiple nodes collaboratively run forward-pass inference on sharded LLMs (Llama, Qwen2, etc.). Designed to validate dynamic model partitioning, measure communication overhead, and test fault tolerance.
 
-> **Note:** request-scoped KV cache is supported for TinyLlama/Llama-like models on distributed layer shards. `executor.py` is currently optimized for TinyLlama 1.1B or similar architecture.
+> **Note:** Request-scoped KV cache is supported for Llama-like architectures. Model specifications are extracted dynamically from HuggingFace via `AutoConfig`.
 
 ## Architecture
 
@@ -125,10 +125,8 @@ Edit `configs/default.yaml` or pass `--config path/to/config.yaml`:
 
 ```yaml
 model:
-  name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  name: "Qwen/Qwen2-0.5B-Instruct"
   dtype: "float16"
-  num_layers: 22
-
 coordinator:
   port: 50050
   heartbeat_interval_sec: 5.0
@@ -206,6 +204,8 @@ python -m distributed_inference.cli.run_inference --coordinator localhost:50050 
 
 ## Key Design Decisions
 
+- **Dynamic Model Adapters** using HuggingFace `AutoConfig` (no manual architecture setup)
+- **Automatic Tied Weight Handling** (e.g., Qwen2, Llama-3-8B)
 - **gRPC + Protobuf** for inter-node communication (portable, inspectable)
 - **Streaming inference RPC** for live token/hop telemetry to web clients
 - **Layer-wise pipeline parallelism** (minimal cross-node dependencies)
