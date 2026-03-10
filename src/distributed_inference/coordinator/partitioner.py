@@ -105,7 +105,7 @@ def partition_model(
 
     mem_per_layer = estimate_layer_memory_mb(
         hidden_size=model_spec.hidden_size,
-        intermediate_size=model_config.intermediate_size,
+        intermediate_size=model_spec.intermediate_size,
         num_heads=model_spec.num_attention_heads,
         dtype_bytes=dtype_bytes,
     )

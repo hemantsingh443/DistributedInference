@@ -26,11 +26,6 @@ def make_node(node_id: str, vram_mb: int) -> RegisteredNode:
 def model_config():
     return ModelConfig(
         name="test-model",
-        num_layers=22,
-        hidden_size=2048,
-        intermediate_size=5632,
-        num_attention_heads=32,
-        num_kv_heads=4,
     )
 
 @pytest.fixture(autouse=True)
@@ -39,6 +34,7 @@ def mock_model_spec():
         mock.return_value = ModelSpec(
             num_layers=22,
             hidden_size=2048,
+            intermediate_size=5632,
             num_attention_heads=32,
             num_key_value_heads=4,
             vocab_size=32000,

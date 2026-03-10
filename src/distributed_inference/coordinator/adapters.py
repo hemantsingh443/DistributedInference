@@ -21,6 +21,7 @@ class ModelSpec:
     vocab_size: int
     hidden_size: int
     num_layers: int
+    intermediate_size: int
     num_attention_heads: int
     num_key_value_heads: int
     layer_prefix: str
@@ -53,6 +54,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
     vocab_size = getattr(config, "vocab_size", 32000)
     hidden_size = getattr(config, "hidden_size", getattr(config, "n_embd", 4096))
     num_layers = getattr(config, "num_hidden_layers", getattr(config, "n_layer", 0))
+    intermediate_size = getattr(config, "intermediate_size", hidden_size * 4)
     num_attention_heads = getattr(config, "num_attention_heads", getattr(config, "n_head", 0))
     # KV heads might be less than attention heads in GQA architectures
     num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
@@ -65,6 +67,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         num_layers=num_layers,
+        intermediate_size=intermediate_size,
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
         layer_prefix="",

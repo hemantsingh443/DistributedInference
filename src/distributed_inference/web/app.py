@@ -150,9 +150,12 @@ def _event_to_payload(event: inference_pb2.InferenceEvent) -> Tuple[str, dict]:
 
 
 def _is_port_available(port: int) -> bool:
-    """Best-effort check whether a localhost TCP port is free."""
+    """Best-effort check whether a localhost TCP port is free.
+    
+    WARNING: Do NOT use SO_REUSEADDR for this check as it can securely bind 
+    to in-use ports on Windows, yielding false positives.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", port))
             return True

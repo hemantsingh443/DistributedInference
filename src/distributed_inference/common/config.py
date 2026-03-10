@@ -14,14 +14,8 @@ import yaml
 @dataclass
 class ModelConfig:
     """Model-related configuration."""
-    name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    name: str = "Qwen/Qwen2-0.5B-Instruct"
     dtype: str = "float16"  # "float16" or "float32"
-    num_layers: int = 22
-    hidden_size: int = 2048
-    intermediate_size: int = 5632
-    num_attention_heads: int = 32
-    num_kv_heads: int = 4
-    max_sequence_length: int = 2048
 
 
 @dataclass

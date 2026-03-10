@@ -3,12 +3,6 @@
 model:
   name: "Qwen/Qwen2-0.5B-Instruct"
   dtype: "float16"
-  num_layers: 22
-  hidden_size: 2048
-  intermediate_size: 5632
-  num_attention_heads: 32
-  num_kv_heads: 4
-  max_sequence_length: 2048
 
 coordinator:
   host: "localhost"

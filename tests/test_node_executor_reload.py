@@ -9,6 +9,7 @@ from distributed_inference.coordinator.adapters import ModelSpec
 DEFAULT_LLAMA_SPEC = ModelSpec(
     num_layers=32,
     hidden_size=4096,
+    intermediate_size=11008,
     num_attention_heads=32,
     num_key_value_heads=32,
     vocab_size=32000,
