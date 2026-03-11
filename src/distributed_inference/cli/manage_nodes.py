@@ -1,4 +1,4 @@
-"""CLI for dynamic node management via the web gateway API."""
+"""CLI for dynamic node and model management via the web gateway API."""
 
 import argparse
 import json
@@ -72,6 +72,25 @@ def _stop(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
 
 
+def _model_list(args: argparse.Namespace) -> None:
+    models = _request_json("GET", args.web_url, "/api/models")
+    print("Available models:")
+    for i, name in enumerate(models, 1):
+        print(f"  {i}. {name}")
+
+
+def _model_switch(args: argparse.Namespace) -> None:
+    result = _request_json(
+        "POST", args.web_url, "/api/model/switch",
+        payload={"model_name": args.name},
+    )
+    if result.get("success"):
+        print(f"Model switch to '{args.name}' initiated.")
+        print(f"Status: {result.get('status', '')}")
+    else:
+        print(f"Model switch failed: {result.get('status', 'unknown error')}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Manage dynamic node onboarding via web gateway"
@@ -109,8 +128,19 @@ def main() -> None:
     stop_parser.add_argument("--node-id", type=str, required=True)
     stop_parser.set_defaults(func=_stop)
 
+    # --- Model management subcommands ---
+    model_list_parser = subparsers.add_parser("model-list", help="List available models")
+    model_list_parser.set_defaults(func=_model_list)
+
+    model_switch_parser = subparsers.add_parser("model-switch", help="Switch the active model")
+    model_switch_parser.add_argument(
+        "--name", type=str, required=True,
+        help="Model name to switch to (e.g. Qwen/Qwen2-0.5B-Instruct)"
+    )
+    model_switch_parser.set_defaults(func=_model_switch)
+
     args = parser.parse_args()
-    setup_logging(level=args.log_level, component="nodes-cli")
+    setup_logging(level=args.log_level, component="manage-cli")
     args.func(args)
 
 

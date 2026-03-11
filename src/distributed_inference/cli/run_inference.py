@@ -1,6 +1,7 @@
 """CLI entry point for submitting an inference request."""
 
 import argparse
+import sys
 import uuid
 
 import grpc
@@ -10,6 +11,65 @@ from distributed_inference.proto import inference_pb2
 from distributed_inference.proto import inference_pb2_grpc
 
 log = get_logger(__name__)
+
+
+def _run_unary(stub, request):
+    """Submit a blocking unary inference request."""
+    try:
+        response = stub.SubmitInference(request, timeout=300)
+
+        print("\n" + "=" * 60)
+        print("GENERATED TEXT:")
+        print("=" * 60)
+        print(response.generated_text)
+        print("=" * 60)
+        print(f"Tokens generated: {response.tokens_generated}")
+        print(f"Total latency:    {response.total_latency_ms:.1f}ms")
+        print(f"Throughput:       {response.tokens_per_second:.2f} tok/s")
+
+        if response.per_hop_latency_ms:
+            print(f"Per-hop latency:  {[f'{l:.1f}ms' for l in response.per_hop_latency_ms[:10]]}")
+
+    except grpc.RpcError as e:
+        log.error(f"Inference request failed: {e.code()} - {e.details()}")
+        sys.exit(1)
+
+
+def _run_stream(stub, request):
+    """Submit a streaming inference request and print tokens as they arrive."""
+    try:
+        stream = stub.SubmitInferenceStream(request, timeout=300)
+
+        print("\n" + "=" * 60)
+        print("STREAMING OUTPUT:")
+        print("=" * 60)
+
+        final_response = None
+        for event in stream:
+            if event.HasField("token"):
+                sys.stdout.write(event.token.token_text)
+                sys.stdout.flush()
+            elif event.HasField("hop"):
+                log.debug(
+                    f"Hop {event.hop.hop_index}: node={event.hop.node_id} "
+                    f"layers=[{event.hop.start_layer}-{event.hop.end_layer}] "
+                    f"{event.hop.hop_latency_ms:.1f}ms"
+                )
+            elif event.HasField("completed"):
+                final_response = event.completed
+            elif event.HasField("error"):
+                log.error(f"Stream error: {event.error}")
+                sys.exit(1)
+
+        print("\n" + "=" * 60)
+        if final_response:
+            print(f"Tokens generated: {final_response.tokens_generated}")
+            print(f"Total latency:    {final_response.total_latency_ms:.1f}ms")
+            print(f"Throughput:       {final_response.tokens_per_second:.2f} tok/s")
+
+    except grpc.RpcError as e:
+        log.error(f"Streaming inference failed: {e.code()} - {e.details()}")
+        sys.exit(1)
 
 
 def main():
@@ -44,6 +104,10 @@ def main():
         "--user-id", type=str, default="",
         help="Optional user identifier for scheduler fairness"
     )
+    parser.add_argument(
+        "--stream", action="store_true",
+        help="Enable streaming mode (tokens printed as they arrive)"
+    )
 
     args = parser.parse_args()
 
@@ -68,23 +132,10 @@ def main():
 
     log.info(f"Sending inference request: '{args.prompt[:50]}...'")
 
-    try:
-        response = stub.SubmitInference(request, timeout=300)
-
-        print("\n" + "=" * 60)
-        print("GENERATED TEXT:")
-        print("=" * 60)
-        print(response.generated_text)
-        print("=" * 60)
-        print(f"Tokens generated: {response.tokens_generated}")
-        print(f"Total latency:    {response.total_latency_ms:.1f}ms")
-        print(f"Throughput:       {response.tokens_per_second:.2f} tok/s")
-
-        if response.per_hop_latency_ms:
-            print(f"Per-hop latency:  {[f'{l:.1f}ms' for l in response.per_hop_latency_ms[:10]]}")
-
-    except grpc.RpcError as e:
-        log.error(f"Inference request failed: {e.code()} - {e.details()}")
+    if args.stream:
+        _run_stream(stub, request)
+    else:
+        _run_unary(stub, request)
 
 
 if __name__ == "__main__":

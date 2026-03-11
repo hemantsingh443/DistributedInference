@@ -33,6 +33,10 @@ def main():
         help="Automatically set up model once min-nodes register"
     )
     parser.add_argument(
+        "--model", type=str, default=None,
+        help="Override the initial active model name (e.g. Qwen/Qwen2-0.5B-Instruct)"
+    )
+    parser.add_argument(
         "--enable-concurrent-scheduler",
         action="store_true",
         help="Enable multi-user concurrent scheduler and fairness runtime",
@@ -50,6 +54,8 @@ def main():
     config = load_config(args.config)
     config.coordinator.port = args.port
     config.coordinator.host = args.host
+    if args.model:
+        config.coordinator.active_model_name = args.model
     if args.enable_concurrent_scheduler:
         config.coordinator.enable_concurrent_scheduler = True
 
