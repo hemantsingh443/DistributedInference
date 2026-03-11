@@ -117,6 +117,15 @@ message CancelInferenceResponse {
   string status = 2;
 }
 
+message SwitchModelRequest {
+  string model_name = 1;
+}
+
+message SwitchModelResponse {
+  bool success = 1;
+  string status = 2;
+}
+
 // Per-hop telemetry event emitted during streaming inference.
 message HopEvent {
   int32 step = 1;
@@ -207,4 +216,7 @@ service CoordinatorService {
 
   // Client requests cancellation of an in-flight inference request.
   rpc CancelInference(CancelInferenceRequest) returns (CancelInferenceResponse);
+
+  // Client requests the cluster to dynamically switch models
+  rpc SwitchModel(SwitchModelRequest) returns (SwitchModelResponse);
 }

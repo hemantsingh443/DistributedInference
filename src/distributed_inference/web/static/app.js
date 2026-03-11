@@ -62,6 +62,10 @@
     return;
   }
 
+  const modelSelect = byId("model-select");
+  const switchModelBtn = byId("switch-model-btn");
+  const modelStatusText = byId("model-status-text");
+
   let refreshTimer = null;
   const users = new Map();
   const runs = new Map();
@@ -850,8 +854,60 @@
     }
   });
 
+  const fetchModels = async () => {
+    try {
+      const res = await fetch("/api/models");
+      const data = await res.json();
+      const models = data.models || [];
+      if (modelSelect) {
+        modelSelect.innerHTML = "";
+        for (const m of models) {
+          const opt = document.createElement("option");
+          opt.value = m;
+          opt.textContent = m;
+          modelSelect.appendChild(opt);
+        }
+      }
+      if (modelStatusText && models.length > 0) {
+        modelStatusText.textContent = "Ready - select to switch";
+      }
+    } catch (err) {
+      if (modelStatusText) modelStatusText.textContent = `Error loading models: ${err}`;
+    }
+  };
+
+  if (switchModelBtn) {
+    switchModelBtn.addEventListener("click", async () => {
+      const modelName = modelSelect?.value;
+      if (!modelName) return;
+      
+      switchModelBtn.disabled = true;
+      if (modelStatusText) modelStatusText.textContent = `Switching to ${modelName}...`;
+      
+      try {
+        const res = await fetch("/api/model/switch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ 
+            model_name: modelName,
+            coordinator: coordinatorInput?.value || "" 
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "switch failed");
+        
+        if (modelStatusText) modelStatusText.textContent = `${data.status}`;
+      } catch (err) {
+        if (modelStatusText) modelStatusText.textContent = `Failed: ${err.message || err}`;
+      } finally {
+        switchModelBtn.disabled = false;
+      }
+    });
+  }
+
   updateCliPreview();
   fetchNodes();
+  fetchModels();
   updateLayoutSummary();
   refreshTimer = window.setInterval(fetchNodes, 5000);
 

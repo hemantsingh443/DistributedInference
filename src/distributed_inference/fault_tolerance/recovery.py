@@ -77,6 +77,7 @@ class RecoveryManager:
         # Re-partition the model
         new_plan = partition_model(
             nodes=active_nodes,
+            model_name=self.model_config.coordinator.active_model_name,
             model_config=self.model_config,
         )
 
@@ -89,7 +90,7 @@ class RecoveryManager:
             try:
                 self.router.load_shard_on_node(
                     address=node.address,
-                    model_name=self.model_config.name,
+                    model_name=self.model_config.coordinator.active_model_name,
                     start_layer=assignment.start_layer,
                     end_layer=assignment.end_layer,
                     has_embedding=assignment.has_embedding,

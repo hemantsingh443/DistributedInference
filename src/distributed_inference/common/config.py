@@ -14,7 +14,6 @@ import yaml
 @dataclass
 class ModelConfig:
     """Model-related configuration."""
-    name: str = "Qwen/Qwen2-0.5B-Instruct"
     dtype: str = "float16"  # "float16" or "float32"
 
 
@@ -23,6 +22,7 @@ class CoordinatorConfig:
     """Coordinator settings."""
     host: str = "localhost"
     port: int = 50050
+    active_model_name: str = "Qwen/Qwen2-0.5B-Instruct"
     heartbeat_interval_sec: float = 5.0
     heartbeat_timeout_sec: float = 15.0
     failure_threshold: int = 3  # Missed heartbeats before marking dead

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import inference_pb2 as inference__pb2
+from distributed_inference.proto import inference_pb2 as proto_dot_inference__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in inference_pb2_grpc.py depends on'
+        + ' but the generated code in proto/inference_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -39,33 +39,33 @@ class NodeServiceStub(object):
         """
         self.LoadModelShard = channel.unary_unary(
                 '/distributed_inference.NodeService/LoadModelShard',
-                request_serializer=inference__pb2.ShardAssignment.SerializeToString,
-                response_deserializer=inference__pb2.NodeStatus.FromString,
+                request_serializer=proto_dot_inference__pb2.ShardAssignment.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.NodeStatus.FromString,
                 _registered_method=True)
         self.RunForward = channel.unary_unary(
                 '/distributed_inference.NodeService/RunForward',
-                request_serializer=inference__pb2.ActivationData.SerializeToString,
-                response_deserializer=inference__pb2.ActivationData.FromString,
+                request_serializer=proto_dot_inference__pb2.ActivationData.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.ActivationData.FromString,
                 _registered_method=True)
         self.Heartbeat = channel.unary_unary(
                 '/distributed_inference.NodeService/Heartbeat',
-                request_serializer=inference__pb2.Empty.SerializeToString,
-                response_deserializer=inference__pb2.HeartbeatResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.Empty.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.HeartbeatResponse.FromString,
                 _registered_method=True)
         self.UnloadShard = channel.unary_unary(
                 '/distributed_inference.NodeService/UnloadShard',
-                request_serializer=inference__pb2.Empty.SerializeToString,
-                response_deserializer=inference__pb2.NodeStatus.FromString,
+                request_serializer=proto_dot_inference__pb2.Empty.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.NodeStatus.FromString,
                 _registered_method=True)
         self.ClearRequestCache = channel.unary_unary(
                 '/distributed_inference.NodeService/ClearRequestCache',
-                request_serializer=inference__pb2.CacheControl.SerializeToString,
-                response_deserializer=inference__pb2.Empty.FromString,
+                request_serializer=proto_dot_inference__pb2.CacheControl.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.Empty.FromString,
                 _registered_method=True)
         self.CancelRequest = channel.unary_unary(
                 '/distributed_inference.NodeService/CancelRequest',
-                request_serializer=inference__pb2.CacheControl.SerializeToString,
-                response_deserializer=inference__pb2.Empty.FromString,
+                request_serializer=proto_dot_inference__pb2.CacheControl.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.Empty.FromString,
                 _registered_method=True)
 
 
@@ -122,33 +122,33 @@ def add_NodeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'LoadModelShard': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadModelShard,
-                    request_deserializer=inference__pb2.ShardAssignment.FromString,
-                    response_serializer=inference__pb2.NodeStatus.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.ShardAssignment.FromString,
+                    response_serializer=proto_dot_inference__pb2.NodeStatus.SerializeToString,
             ),
             'RunForward': grpc.unary_unary_rpc_method_handler(
                     servicer.RunForward,
-                    request_deserializer=inference__pb2.ActivationData.FromString,
-                    response_serializer=inference__pb2.ActivationData.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.ActivationData.FromString,
+                    response_serializer=proto_dot_inference__pb2.ActivationData.SerializeToString,
             ),
             'Heartbeat': grpc.unary_unary_rpc_method_handler(
                     servicer.Heartbeat,
-                    request_deserializer=inference__pb2.Empty.FromString,
-                    response_serializer=inference__pb2.HeartbeatResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.Empty.FromString,
+                    response_serializer=proto_dot_inference__pb2.HeartbeatResponse.SerializeToString,
             ),
             'UnloadShard': grpc.unary_unary_rpc_method_handler(
                     servicer.UnloadShard,
-                    request_deserializer=inference__pb2.Empty.FromString,
-                    response_serializer=inference__pb2.NodeStatus.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.Empty.FromString,
+                    response_serializer=proto_dot_inference__pb2.NodeStatus.SerializeToString,
             ),
             'ClearRequestCache': grpc.unary_unary_rpc_method_handler(
                     servicer.ClearRequestCache,
-                    request_deserializer=inference__pb2.CacheControl.FromString,
-                    response_serializer=inference__pb2.Empty.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.CacheControl.FromString,
+                    response_serializer=proto_dot_inference__pb2.Empty.SerializeToString,
             ),
             'CancelRequest': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelRequest,
-                    request_deserializer=inference__pb2.CacheControl.FromString,
-                    response_serializer=inference__pb2.Empty.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.CacheControl.FromString,
+                    response_serializer=proto_dot_inference__pb2.Empty.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -179,8 +179,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/LoadModelShard',
-            inference__pb2.ShardAssignment.SerializeToString,
-            inference__pb2.NodeStatus.FromString,
+            proto_dot_inference__pb2.ShardAssignment.SerializeToString,
+            proto_dot_inference__pb2.NodeStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -206,8 +206,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/RunForward',
-            inference__pb2.ActivationData.SerializeToString,
-            inference__pb2.ActivationData.FromString,
+            proto_dot_inference__pb2.ActivationData.SerializeToString,
+            proto_dot_inference__pb2.ActivationData.FromString,
             options,
             channel_credentials,
             insecure,
@@ -233,8 +233,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/Heartbeat',
-            inference__pb2.Empty.SerializeToString,
-            inference__pb2.HeartbeatResponse.FromString,
+            proto_dot_inference__pb2.Empty.SerializeToString,
+            proto_dot_inference__pb2.HeartbeatResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -260,8 +260,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/UnloadShard',
-            inference__pb2.Empty.SerializeToString,
-            inference__pb2.NodeStatus.FromString,
+            proto_dot_inference__pb2.Empty.SerializeToString,
+            proto_dot_inference__pb2.NodeStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -287,8 +287,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/ClearRequestCache',
-            inference__pb2.CacheControl.SerializeToString,
-            inference__pb2.Empty.FromString,
+            proto_dot_inference__pb2.CacheControl.SerializeToString,
+            proto_dot_inference__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -314,8 +314,8 @@ class NodeService(object):
             request,
             target,
             '/distributed_inference.NodeService/CancelRequest',
-            inference__pb2.CacheControl.SerializeToString,
-            inference__pb2.Empty.FromString,
+            proto_dot_inference__pb2.CacheControl.SerializeToString,
+            proto_dot_inference__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -341,28 +341,33 @@ class CoordinatorServiceStub(object):
         """
         self.RegisterNode = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/RegisterNode',
-                request_serializer=inference__pb2.NodeInfo.SerializeToString,
-                response_deserializer=inference__pb2.RegistrationAck.FromString,
+                request_serializer=proto_dot_inference__pb2.NodeInfo.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.RegistrationAck.FromString,
                 _registered_method=True)
         self.ReportHealth = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/ReportHealth',
-                request_serializer=inference__pb2.NodeStatus.SerializeToString,
-                response_deserializer=inference__pb2.Empty.FromString,
+                request_serializer=proto_dot_inference__pb2.NodeStatus.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.Empty.FromString,
                 _registered_method=True)
         self.SubmitInference = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/SubmitInference',
-                request_serializer=inference__pb2.InferenceRequest.SerializeToString,
-                response_deserializer=inference__pb2.InferenceResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.InferenceRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.InferenceResponse.FromString,
                 _registered_method=True)
         self.SubmitInferenceStream = channel.unary_stream(
                 '/distributed_inference.CoordinatorService/SubmitInferenceStream',
-                request_serializer=inference__pb2.InferenceRequest.SerializeToString,
-                response_deserializer=inference__pb2.InferenceEvent.FromString,
+                request_serializer=proto_dot_inference__pb2.InferenceRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.InferenceEvent.FromString,
                 _registered_method=True)
         self.CancelInference = channel.unary_unary(
                 '/distributed_inference.CoordinatorService/CancelInference',
-                request_serializer=inference__pb2.CancelInferenceRequest.SerializeToString,
-                response_deserializer=inference__pb2.CancelInferenceResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.CancelInferenceRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.CancelInferenceResponse.FromString,
+                _registered_method=True)
+        self.SwitchModel = channel.unary_unary(
+                '/distributed_inference.CoordinatorService/SwitchModel',
+                request_serializer=proto_dot_inference__pb2.SwitchModelRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.SwitchModelResponse.FromString,
                 _registered_method=True)
 
 
@@ -407,33 +412,45 @@ class CoordinatorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SwitchModel(self, request, context):
+        """Client requests the cluster to dynamically switch models
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'RegisterNode': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterNode,
-                    request_deserializer=inference__pb2.NodeInfo.FromString,
-                    response_serializer=inference__pb2.RegistrationAck.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.NodeInfo.FromString,
+                    response_serializer=proto_dot_inference__pb2.RegistrationAck.SerializeToString,
             ),
             'ReportHealth': grpc.unary_unary_rpc_method_handler(
                     servicer.ReportHealth,
-                    request_deserializer=inference__pb2.NodeStatus.FromString,
-                    response_serializer=inference__pb2.Empty.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.NodeStatus.FromString,
+                    response_serializer=proto_dot_inference__pb2.Empty.SerializeToString,
             ),
             'SubmitInference': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitInference,
-                    request_deserializer=inference__pb2.InferenceRequest.FromString,
-                    response_serializer=inference__pb2.InferenceResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.InferenceRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.InferenceResponse.SerializeToString,
             ),
             'SubmitInferenceStream': grpc.unary_stream_rpc_method_handler(
                     servicer.SubmitInferenceStream,
-                    request_deserializer=inference__pb2.InferenceRequest.FromString,
-                    response_serializer=inference__pb2.InferenceEvent.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.InferenceRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.InferenceEvent.SerializeToString,
             ),
             'CancelInference': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelInference,
-                    request_deserializer=inference__pb2.CancelInferenceRequest.FromString,
-                    response_serializer=inference__pb2.CancelInferenceResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.CancelInferenceRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.CancelInferenceResponse.SerializeToString,
+            ),
+            'SwitchModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.SwitchModel,
+                    request_deserializer=proto_dot_inference__pb2.SwitchModelRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.SwitchModelResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -464,8 +481,8 @@ class CoordinatorService(object):
             request,
             target,
             '/distributed_inference.CoordinatorService/RegisterNode',
-            inference__pb2.NodeInfo.SerializeToString,
-            inference__pb2.RegistrationAck.FromString,
+            proto_dot_inference__pb2.NodeInfo.SerializeToString,
+            proto_dot_inference__pb2.RegistrationAck.FromString,
             options,
             channel_credentials,
             insecure,
@@ -491,8 +508,8 @@ class CoordinatorService(object):
             request,
             target,
             '/distributed_inference.CoordinatorService/ReportHealth',
-            inference__pb2.NodeStatus.SerializeToString,
-            inference__pb2.Empty.FromString,
+            proto_dot_inference__pb2.NodeStatus.SerializeToString,
+            proto_dot_inference__pb2.Empty.FromString,
             options,
             channel_credentials,
             insecure,
@@ -518,8 +535,8 @@ class CoordinatorService(object):
             request,
             target,
             '/distributed_inference.CoordinatorService/SubmitInference',
-            inference__pb2.InferenceRequest.SerializeToString,
-            inference__pb2.InferenceResponse.FromString,
+            proto_dot_inference__pb2.InferenceRequest.SerializeToString,
+            proto_dot_inference__pb2.InferenceResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -545,8 +562,8 @@ class CoordinatorService(object):
             request,
             target,
             '/distributed_inference.CoordinatorService/SubmitInferenceStream',
-            inference__pb2.InferenceRequest.SerializeToString,
-            inference__pb2.InferenceEvent.FromString,
+            proto_dot_inference__pb2.InferenceRequest.SerializeToString,
+            proto_dot_inference__pb2.InferenceEvent.FromString,
             options,
             channel_credentials,
             insecure,
@@ -572,8 +589,35 @@ class CoordinatorService(object):
             request,
             target,
             '/distributed_inference.CoordinatorService/CancelInference',
-            inference__pb2.CancelInferenceRequest.SerializeToString,
-            inference__pb2.CancelInferenceResponse.FromString,
+            proto_dot_inference__pb2.CancelInferenceRequest.SerializeToString,
+            proto_dot_inference__pb2.CancelInferenceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SwitchModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/distributed_inference.CoordinatorService/SwitchModel',
+            proto_dot_inference__pb2.SwitchModelRequest.SerializeToString,
+            proto_dot_inference__pb2.SwitchModelResponse.FromString,
             options,
             channel_credentials,
             insecure,

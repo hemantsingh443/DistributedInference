@@ -15,7 +15,7 @@ class TestPipelineBasic:
         """Test that default config loads correctly."""
         from distributed_inference.common.config import load_config
         config = load_config()
-        assert config.model.name == "Qwen/Qwen2-0.5B-Instruct"
+        assert config.coordinator.active_model_name == "Qwen/Qwen2-0.5B-Instruct"
         assert config.coordinator.port == 50050
 
     def test_profiler_metrics(self):

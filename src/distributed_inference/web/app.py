@@ -66,6 +66,13 @@ class CancelRunRequest(BaseModel):
     reason: str = "cancelled by user"
 
 
+class SwitchModelPayload(BaseModel):
+    """Payload for dynamically switching the active model."""
+    
+    model_name: str
+    coordinator: str | None = None
+
+
 class RunLogStore:
     """In-memory request-scoped event store with a fixed per-run cap."""
 
@@ -565,6 +572,49 @@ def create_app(default_coordinator: str | None = None) -> FastAPI:
             request.app.state.managed_nodes.pop(node_id, None)
 
         return JSONResponse({"success": True, "node_id": node_id})
+
+    @app.get("/api/models")
+    def list_models(request: Request):
+        """Return the available models from the catalog."""
+        models_path = request.app.state.project_root / "configs" / "models.json"
+        try:
+            with open(models_path, "r", encoding="utf-8") as f:
+                models = json.load(f)
+            return JSONResponse({"models": models})
+        except Exception as e:
+            log.error(f"Failed to read models catalog: {e}")
+            return JSONResponse({"models": []})
+
+    @app.post("/api/model/switch")
+    def switch_model(payload: SwitchModelPayload, request: Request):
+        """Request the coordinator to switch the active model."""
+        coordinator_addr = payload.coordinator or request.app.state.default_coordinator
+        options = [
+            ("grpc.max_send_message_length", 256 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+        ]
+        channel = grpc.insecure_channel(coordinator_addr, options=options)
+        stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
+        try:
+            response = stub.SwitchModel(
+                inference_pb2.SwitchModelRequest(
+                    model_name=payload.model_name
+                ),
+                timeout=10,
+            )
+            return JSONResponse(
+                {
+                    "success": bool(response.success),
+                    "status": response.status,
+                }
+            )
+        except grpc.RpcError as rpc_error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{rpc_error.code().name}: {rpc_error.details()}",
+            ) from rpc_error
+        finally:
+            channel.close()
 
     @app.get("/api/stream")
     def stream_inference(

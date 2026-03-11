@@ -1,10 +1,10 @@
 # Distributed Inference System — Default Configuration
 
 model:
-  name: "Qwen/Qwen2-0.5B-Instruct"
   dtype: "float16"
 
 coordinator:
+  active_model_name: "Qwen/Qwen2-0.5B-Instruct"
   host: "localhost"
   port: 50050
   heartbeat_interval_sec: 5.0

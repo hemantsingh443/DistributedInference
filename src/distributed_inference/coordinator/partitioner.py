@@ -80,6 +80,7 @@ class _NodeCostProfile:
 
 def partition_model(
     nodes: List[RegisteredNode],
+    model_name: str,
     model_config: ModelConfig,
     *,
     alpha_latency: float = 0.7,
@@ -99,7 +100,7 @@ def partition_model(
         raise ValueError("No nodes available for partitioning")
 
     # Fetch dynamic model architecture specification
-    model_spec = get_model_spec(model_config.name)
+    model_spec = get_model_spec(model_name)
     total_layers = model_spec.num_layers
     dtype_bytes = 2 if model_config.dtype == "float16" else 4
 
@@ -238,7 +239,7 @@ def partition_model(
 
     plan = PartitionPlan(
         assignments=assignments,
-        model_name=model_config.name,
+        model_name=model_name,
         total_layers=total_layers,
         total_estimated_memory_mb=total_model_memory,
         estimated_latency_score=sum(1.0 / max(p.score, 1e-6) for p in ordered_profiles),

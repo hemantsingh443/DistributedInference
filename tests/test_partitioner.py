@@ -24,9 +24,7 @@ def make_node(node_id: str, vram_mb: int) -> RegisteredNode:
 
 @pytest.fixture
 def model_config():
-    return ModelConfig(
-        name="test-model",
-    )
+    return ModelConfig()
 
 @pytest.fixture(autouse=True)
 def mock_model_spec():
@@ -53,7 +51,7 @@ class TestPartitionModel:
     def test_single_node(self, model_config):
         """Single node gets all layers."""
         nodes = [make_node("node-0", 4096)]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
 
         assert len(plan.assignments) == 1
         a = plan.assignments[0]
@@ -65,7 +63,7 @@ class TestPartitionModel:
     def test_two_equal_nodes(self, model_config):
         """Two equal nodes split layers roughly evenly."""
         nodes = [make_node("node-0", 2048), make_node("node-1", 2048)]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
 
         assert len(plan.assignments) == 2
         total_layers = sum(
@@ -88,7 +86,7 @@ class TestPartitionModel:
             make_node("node-1", 1024),
             make_node("node-2", 2048),
         ]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
 
         assert len(plan.assignments) == 3
         total_layers = sum(
@@ -107,7 +105,7 @@ class TestPartitionModel:
             make_node("node-1", 1024),
             make_node("node-2", 1024),
         ]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
 
         sorted_assignments = sorted(plan.assignments, key=lambda a: a.start_layer)
         for i in range(1, len(sorted_assignments)):
@@ -119,7 +117,7 @@ class TestPartitionModel:
     def test_no_nodes_raises(self, model_config):
         """Should raise ValueError with no nodes."""
         with pytest.raises(ValueError, match="No nodes available"):
-            partition_model([], model_config)
+            partition_model([], "test-model", model_config)
 
     def test_ordered_nodes(self, model_config):
         """get_ordered_nodes returns nodes in pipeline order."""
@@ -127,14 +125,14 @@ class TestPartitionModel:
             make_node("node-0", 1024),
             make_node("node-1", 2048),
         ]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
         ordered = plan.get_ordered_nodes()
         assert len(ordered) == 2
 
     def test_plan_summary(self, model_config):
         """Partition plan summary is human-readable."""
         nodes = [make_node("node-0", 4096)]
-        plan = partition_model(nodes, model_config)
+        plan = partition_model(nodes, "test-model", model_config)
         summary = plan.summary()
         assert "test-model" in summary
         assert "22 layers" in summary

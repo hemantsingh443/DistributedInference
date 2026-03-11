@@ -252,6 +252,16 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             status="cancellation requested",
         )
 
+    def SwitchModel(self, request, context):
+        """Handle request to dynamically switch the active model."""
+        success, status_msg = self.orchestrator.switch_active_model(
+            model_name=request.model_name
+        )
+        return inference_pb2.SwitchModelResponse(
+            success=success,
+            status=status_msg,
+        )
+
 
 class Orchestrator:
     """Central coordinator for the distributed inference system.
@@ -463,8 +473,8 @@ class Orchestrator:
         """Load tokenizer lazily and exactly once."""
         if self._tokenizer is not None:
             return
-        log.info(f"Loading tokenizer for {self.config.model.name}")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.model.name)
+        log.info(f"Loading tokenizer for {self.config.coordinator.active_model_name}")
+        self._tokenizer = AutoTokenizer.from_pretrained(self.config.coordinator.active_model_name)
 
     def _on_registry_change(self, event: str, _node) -> None:
         """Schedule a rebalance for topology-changing events."""
@@ -511,6 +521,7 @@ class Orchestrator:
                     try:
                         new_plan = partition_model(
                             nodes=nodes,
+                            model_name=self.config.coordinator.active_model_name,
                             model_config=self.config.model,
                             alpha_latency=self.config.coordinator.allocation_alpha_latency,
                             beta_throughput=self.config.coordinator.allocation_beta_throughput,
@@ -683,7 +694,7 @@ class Orchestrator:
             try:
                 self.router.load_shard_on_node(
                     address=node.address,
-                    model_name=self.config.model.name,
+                    model_name=self.config.coordinator.active_model_name,
                     start_layer=assignment.start_layer,
                     end_layer=assignment.end_layer,
                     has_embedding=assignment.has_embedding,
@@ -869,6 +880,22 @@ class Orchestrator:
         raise RequestCancelledError(
             f"request {request_context.request_id} cancelled: {reason}"
         )
+
+    def switch_active_model(self, model_name: str) -> tuple[bool, str]:
+        """Dynamically switch the active model running on the cluster."""
+        with self._state_lock:
+            if not self._running:
+                return False, "Orchestrator is not running"
+            
+            log.info(f"[bold green]Received request to switch model to {model_name}[/]")
+            
+            self.config.coordinator.active_model_name = model_name
+            self._tokenizer = None  # Force tokenizer to reload on next request
+            
+            # Request rebalance to swap model weights across nodes
+            self._rebalance_controller.request("topology:model_switch")
+            
+            return True, f"Model switch to {model_name} requested. Cluster is rebalancing."
 
     def cancel_inference(self, request_id: str, reason: str = "cancelled") -> bool:
         """Request cancellation for an active inference context."""

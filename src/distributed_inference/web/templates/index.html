@@ -77,6 +77,22 @@
           </div>
         </section>
 
+        <!-- ── 1.5. Model Configuration ───────────────────── -->
+        <section class="panel">
+          <div class="panel-title">Model Configuration</div>
+          <form id="model-form" class="stack-form">
+            <label>Select Model
+              <select id="model-select" name="model_name">
+                <option value="">Loading models...</option>
+              </select>
+            </label>
+            <div class="actions">
+              <button id="switch-model-btn" type="button" class="secondary">Apply Switch</button>
+            </div>
+            <p id="model-status-text" class="muted">Ready</p>
+          </form>
+        </section>
+
         <!-- ── 2. Inference Config ────────────────────────── -->
         <section class="panel">
           <div class="panel-title">Inference Config</div>
