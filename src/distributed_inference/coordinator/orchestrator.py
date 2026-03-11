@@ -522,7 +522,6 @@ class Orchestrator:
                         new_plan = partition_model(
                             nodes=nodes,
                             model_name=self.config.coordinator.active_model_name,
-                            model_config=self.config.model,
                             alpha_latency=self.config.coordinator.allocation_alpha_latency,
                             beta_throughput=self.config.coordinator.allocation_beta_throughput,
                             default_bandwidth_mbps=self.config.coordinator.default_bandwidth_mbps,
@@ -699,7 +698,7 @@ class Orchestrator:
                     end_layer=assignment.end_layer,
                     has_embedding=assignment.has_embedding,
                     has_lm_head=assignment.has_lm_head,
-                    dtype=self.config.model.dtype,
+                    dtype="float16",
                 )
             except Exception as e:
                 raise NodeLoadError(

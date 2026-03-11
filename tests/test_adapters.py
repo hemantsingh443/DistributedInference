@@ -26,6 +26,7 @@ for model in models_to_test:
         print(f"  Embed Prefix: {spec.embed_prefix}")
         print(f"  Final Norm Prefix: {spec.final_norm_prefix}")
         print(f"  LM Head Prefix: {spec.lm_head_prefix}")
+        print(f"  Dtype Bytes: {spec.dtype_bytes}")
     except Exception as e:
         print(f"  FAILED: {e}")
         

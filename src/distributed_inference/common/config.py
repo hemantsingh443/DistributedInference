@@ -12,12 +12,6 @@ import yaml
 
 
 @dataclass
-class ModelConfig:
-    """Model-related configuration."""
-    dtype: str = "float16"  # "float16" or "float32"
-
-
-@dataclass
 class CoordinatorConfig:
     """Coordinator settings."""
     host: str = "localhost"
@@ -94,7 +88,6 @@ class CommunicationConfig:
 @dataclass
 class SystemConfig:
     """Top-level configuration combining all subsystems."""
-    model: ModelConfig = field(default_factory=ModelConfig)
     coordinator: CoordinatorConfig = field(default_factory=CoordinatorConfig)
     node: NodeConfig = field(default_factory=NodeConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -127,11 +120,6 @@ def load_config(config_path: Optional[str] = None) -> SystemConfig:
             raw = yaml.safe_load(f) or {}
 
         # Merge YAML values into dataclass fields
-        if "model" in raw:
-            for k, v in raw["model"].items():
-                if hasattr(config.model, k):
-                    setattr(config.model, k, v)
-
         if "coordinator" in raw:
             for k, v in raw["coordinator"].items():
                 if hasattr(config.coordinator, k):

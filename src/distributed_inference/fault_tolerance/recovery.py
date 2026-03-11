@@ -10,7 +10,7 @@ from distributed_inference.common.logging import get_logger
 from distributed_inference.coordinator.partitioner import partition_model, PartitionPlan
 from distributed_inference.coordinator.registry import NodeRegistry, NodeState
 from distributed_inference.coordinator.router import ActivationRouter
-from distributed_inference.common.config import ModelConfig
+from distributed_inference.common.config import SystemConfig
 from distributed_inference.fault_tolerance.checkpointing import CheckpointManager
 
 log = get_logger(__name__)
@@ -31,12 +31,12 @@ class RecoveryManager:
         registry: NodeRegistry,
         router: ActivationRouter,
         checkpoint_manager: CheckpointManager,
-        model_config: ModelConfig,
+        config: SystemConfig,
     ):
         self.registry = registry
         self.router = router
         self.checkpoint_manager = checkpoint_manager
-        self.model_config = model_config
+        self.config = config
 
     def handle_node_failure(
         self,
@@ -77,8 +77,7 @@ class RecoveryManager:
         # Re-partition the model
         new_plan = partition_model(
             nodes=active_nodes,
-            model_name=self.model_config.coordinator.active_model_name,
-            model_config=self.model_config,
+            model_name=self.config.coordinator.active_model_name,
         )
 
         # Reload shards on new assignments
@@ -90,12 +89,12 @@ class RecoveryManager:
             try:
                 self.router.load_shard_on_node(
                     address=node.address,
-                    model_name=self.model_config.coordinator.active_model_name,
+                    model_name=self.config.coordinator.active_model_name,
                     start_layer=assignment.start_layer,
                     end_layer=assignment.end_layer,
                     has_embedding=assignment.has_embedding,
                     has_lm_head=assignment.has_lm_head,
-                    dtype=self.model_config.dtype,
+                    dtype="float16",
                 )
 
                 self.registry.set_node_assignment(

@@ -17,7 +17,8 @@ DEFAULT_LLAMA_SPEC = ModelSpec(
     embed_prefix="model.embed_tokens.",
     final_norm_prefix="model.norm.",
     lm_head_prefix="lm_head.",
-    tie_word_embeddings=False
+    tie_word_embeddings=False,
+    dtype_bytes=2
 )
 
 

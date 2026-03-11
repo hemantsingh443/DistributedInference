@@ -3,8 +3,6 @@
 import math
 from dataclasses import dataclass
 from typing import List, Optional
-
-from distributed_inference.common.config import ModelConfig
 from distributed_inference.common.logging import get_logger
 from distributed_inference.common.serialization import estimate_layer_memory_mb
 from distributed_inference.coordinator.adapters import get_model_spec
@@ -81,7 +79,6 @@ class _NodeCostProfile:
 def partition_model(
     nodes: List[RegisteredNode],
     model_name: str,
-    model_config: ModelConfig,
     *,
     alpha_latency: float = 0.7,
     beta_throughput: float = 0.3,
@@ -102,7 +99,7 @@ def partition_model(
     # Fetch dynamic model architecture specification
     model_spec = get_model_spec(model_name)
     total_layers = model_spec.num_layers
-    dtype_bytes = 2 if model_config.dtype == "float16" else 4
+    dtype_bytes = float(model_spec.dtype_bytes)
 
     mem_per_layer = estimate_layer_memory_mb(
         hidden_size=model_spec.hidden_size,

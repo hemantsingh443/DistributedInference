@@ -1,8 +1,5 @@
 # Distributed Inference System — Default Configuration
 
-model:
-  dtype: "float16"
-
 coordinator:
   active_model_name: "Qwen/Qwen2-0.5B-Instruct"
   host: "localhost"

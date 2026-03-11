@@ -29,6 +29,7 @@ class ModelSpec:
     final_norm_prefix: str
     lm_head_prefix: str
     tie_word_embeddings: bool
+    dtype_bytes: int
 
 
 def get_model_spec(model_name: str) -> ModelSpec:
@@ -59,6 +60,21 @@ def get_model_spec(model_name: str) -> ModelSpec:
     # KV heads might be less than attention heads in GQA architectures
     num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
     tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
+    
+    # Calculate bytes per parameter from torch_dtype (fallback to FP16)
+    torch_dtype = getattr(config, "torch_dtype", None)
+    dtype_bytes = 2  # Default to FP16
+    if torch_dtype is not None:
+        dtype_str = str(torch_dtype).lower()
+        if "fp32" in dtype_str or "float32" in dtype_str:
+            dtype_bytes = 4
+        elif "fp16" in dtype_str or "float16" in dtype_str or "bfloat16" in dtype_str:
+            dtype_bytes = 2
+        elif "int8" in dtype_str:
+            dtype_bytes = 1
+        elif "int4" in dtype_str or "nf4" in dtype_str:
+            dtype_bytes = 0.5  # Approximate memory footprint for 4-bit
+            
 
     if num_layers == 0 or num_attention_heads == 0:
         raise ValueError(f"Could not extract layer/head counts from config for {model_name}")
@@ -75,6 +91,7 @@ def get_model_spec(model_name: str) -> ModelSpec:
         final_norm_prefix="",
         lm_head_prefix="",
         tie_word_embeddings=tie_word_embeddings,
+        dtype_bytes=dtype_bytes,
     )
 
     # Route weight key prefixes by architecture
