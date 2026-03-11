@@ -1098,6 +1098,11 @@ class Orchestrator:
                     attention_mask_buffer = torch.ones((1, initial_len + max_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
                     attention_mask_buffer[0, :initial_len] = attention_mask[0]
 
+                # Track previous accumulated text to derive correct token_text via diffing
+                prev_accumulated = self._tokenizer.decode(
+                    input_ids_buffer[0, :initial_len], skip_special_tokens=True
+                )
+
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
                     request_context.state = "DECODING"
@@ -1159,14 +1164,13 @@ class Orchestrator:
 
                     generated_tokens += 1
                     token_id = int(next_token.item())
-                    token_text = self._tokenizer.decode(
-                        [token_id], skip_special_tokens=False
-                    )
-                    
-                    # Also use preallocated view for decode accumulated
+
+                    # Decode full sequence to get correct spacing (subword boundary fix)
                     accumulated_text = self._tokenizer.decode(
                         input_ids_buffer[0, :current_idx+1], skip_special_tokens=True
                     )
+                    token_text = accumulated_text[len(prev_accumulated):]
+                    prev_accumulated = accumulated_text
 
                     yield inference_pb2.InferenceEvent(
                         request_id=request_id,
@@ -1189,6 +1193,11 @@ class Orchestrator:
                 if attention_mask is not None:
                     attention_mask_buffer = torch.ones((1, initial_len + max_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
                     attention_mask_buffer[0, :initial_len] = attention_mask[0]
+
+                # Track previous accumulated text for correct subword-boundary spacing
+                prev_accumulated = self._tokenizer.decode(
+                    input_ids_buffer[0, :initial_len], skip_special_tokens=True
+                )
 
                 for step in range(max_tokens):
                     self._assert_not_cancelled(request_context, execution_plan)
@@ -1240,11 +1249,13 @@ class Orchestrator:
                     input_ids_buffer[0, current_idx] = next_token.item()
                     generated_tokens += 1
                     token_id = int(next_token.item())
-                    token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
-                    
+
+                    # Decode full sequence to get correct spacing (subword boundary fix)
                     accumulated_text = self._tokenizer.decode(
                         input_ids_buffer[0, :current_idx+1], skip_special_tokens=True
                     )
+                    token_text = accumulated_text[len(prev_accumulated):]
+                    prev_accumulated = accumulated_text
 
                     yield inference_pb2.InferenceEvent(
                         request_id=request_id,
