@@ -121,15 +121,43 @@ class ShardExecutor:
         self,
         model_name: str,
         needed_prefixes: set[str],
+        cache_base_path: str = "",
     ) -> dict[str, dict[str, str]]:
         """Determine which safetensor files contain needed weights.
+
+        If ``cache_base_path`` points to a directory containing pre-cached
+        model files, weights are resolved locally without network calls.
+        Otherwise falls back to ``hf_hub_download``.
 
         Returns:
             Dict mapping local file path -> {weight_key: ...} for each
             key that matches a needed prefix.  The value dict maps
             original weight key -> remapped weight key.
         """
-        # Try sharded index first
+        # --- Cache-aware local resolution ---
+        if cache_base_path and os.path.isdir(cache_base_path):
+            log.info(f"Resolving weights from local cache: {cache_base_path}")
+            index_file = os.path.join(cache_base_path, "model.safetensors.index.json")
+            if os.path.exists(index_file):
+                with open(index_file, "r") as f:
+                    index_data = json.load(f)
+                weight_map: dict[str, str] = index_data["weight_map"]
+                shard_files_needed: dict[str, dict[str, str]] = {}
+                for weight_key, shard_filename in weight_map.items():
+                    if any(weight_key.startswith(p) for p in needed_prefixes):
+                        shard_path = os.path.join(cache_base_path, shard_filename)
+                        if shard_path not in shard_files_needed:
+                            shard_files_needed[shard_path] = {}
+                        shard_files_needed[shard_path][weight_key] = weight_key
+                return shard_files_needed
+            else:
+                # Single-file model in cache
+                single = os.path.join(cache_base_path, "model.safetensors")
+                if os.path.exists(single):
+                    return {single: {}}
+                log.warning("Cache path exists but no safetensors found, falling back to HF download")
+
+        # --- Fallback: HuggingFace Hub download ---
         try:
             index_path = hf_hub_download(
                 model_name, "model.safetensors.index.json"
@@ -168,6 +196,7 @@ class ShardExecutor:
         has_embedding: bool = False,
         has_lm_head: bool = False,
         dtype: str = "float16",
+        cache_base_path: str = "",
     ) -> dict:
         """Load specific layers from a pre-trained model.
 
@@ -233,7 +262,7 @@ class ShardExecutor:
 
         # Resolve which safetensor files contain the needed weights
         log.info(f"Resolving safetensor files for {len(needed_prefixes)} weight groups")
-        shard_file_map = self._resolve_safetensor_files(model_name, needed_prefixes)
+        shard_file_map = self._resolve_safetensor_files(model_name, needed_prefixes, cache_base_path=cache_base_path)
 
         # Load and remap weights from safetensor files
         state_dict: dict[str, torch.Tensor] = {}

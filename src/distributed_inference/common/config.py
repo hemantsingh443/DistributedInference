@@ -45,6 +45,7 @@ class CoordinatorConfig:
     default_bandwidth_mbps: float = 1000.0
     default_latency_ms: float = 5.0
     memory_safety_margin: float = 0.9
+    model_cache_dir: str = "./model_cache"
 
 
 @dataclass

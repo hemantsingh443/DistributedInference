@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from distributed_inference.common.config import SystemConfig, load_config
 from distributed_inference.common.logging import get_logger
 from distributed_inference.coordinator.admission import AdmissionController
+from distributed_inference.coordinator.model_cache import ModelCache
 from distributed_inference.coordinator.concurrent_scheduler import (
     ConcurrentRequestScheduler,
     SchedulerTicket,
@@ -262,6 +263,17 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             status=status_msg,
         )
 
+    def CacheModel(self, request, context):
+        """Handle request to pre-cache a model's weights."""
+        success, cache_path, status_msg = self.orchestrator.cache_model(
+            model_name=request.model_name
+        )
+        return inference_pb2.CacheModelResponse(
+            success=success,
+            cache_path=cache_path,
+            message=status_msg,
+        )
+
 
 class Orchestrator:
     """Central coordinator for the distributed inference system.
@@ -280,6 +292,9 @@ class Orchestrator:
             latency_ms_default=self.config.coordinator.default_latency_ms,
         )
         self.admission = AdmissionController(self.config.coordinator)
+        self.model_cache = ModelCache(
+            cache_dir=self.config.coordinator.model_cache_dir
+        )
 
         self._partition_plan: Optional[PartitionPlan] = None
         self._execution_plan: Optional[ExecutionPlan] = None
@@ -691,6 +706,9 @@ class Orchestrator:
                     ),
                 )
             try:
+                cache_path = self.model_cache.ensure_cached(
+                    self.config.coordinator.active_model_name
+                )
                 self.router.load_shard_on_node(
                     address=node.address,
                     model_name=self.config.coordinator.active_model_name,
@@ -699,6 +717,7 @@ class Orchestrator:
                     has_embedding=assignment.has_embedding,
                     has_lm_head=assignment.has_lm_head,
                     dtype="float16",
+                    cache_base_path=cache_path,
                 )
             except Exception as e:
                 raise NodeLoadError(
@@ -879,6 +898,22 @@ class Orchestrator:
         raise RequestCancelledError(
             f"request {request_context.request_id} cancelled: {reason}"
         )
+
+    def cache_model(self, model_name: str) -> tuple[bool, str, str]:
+        """Pre-cache a model's weights on the coordinator.
+
+        Args:
+            model_name: HuggingFace model ID to cache.
+        Returns:
+            Tuple of (success, cache_path, status_message).
+        """
+        try:
+            log.info(f"Manual pre-caching requested for '{model_name}'")
+            cache_path = self.model_cache.ensure_cached(model_name)
+            return True, cache_path, f"Model '{model_name}' cached at {cache_path}"
+        except Exception as e:
+            log.error(f"Failed to cache model '{model_name}': {e}")
+            return False, "", str(e)
 
     def switch_active_model(self, model_name: str) -> tuple[bool, str]:
         """Dynamically switch the active model running on the cluster."""

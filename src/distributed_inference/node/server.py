@@ -108,6 +108,7 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 has_embedding=request.has_embedding,
                 has_lm_head=request.has_lm_head,
                 dtype=request.dtype or "float16",
+                cache_base_path=getattr(request, "cache_base_path", ""),
             )
             self._set_status(inference_pb2.NodeStatus.READY)
             self._vram_total_mb = stats.get("vram_used_mb", 0)

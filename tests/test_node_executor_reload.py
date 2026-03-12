@@ -47,7 +47,7 @@ def _dummy_from_config(config, *_a, **_kw):
     return _DummyFullModel()
 
 
-def _dummy_resolve_safetensor_files(_self, model_name, needed_prefixes):
+def _dummy_resolve_safetensor_files(_self, model_name, needed_prefixes, cache_base_path=""):
     """Mock _resolve_safetensor_files to return empty mapping."""
     return {}
 

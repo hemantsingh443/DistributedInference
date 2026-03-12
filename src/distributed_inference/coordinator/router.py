@@ -235,6 +235,7 @@ class ActivationRouter:
         has_embedding: bool = False,
         has_lm_head: bool = False,
         dtype: str = "float16",
+        cache_base_path: str = "",
     ) -> inference_pb2.NodeStatus:
         """Instruct a node to load specific model layers.
 
@@ -246,6 +247,7 @@ class ActivationRouter:
             has_embedding: Whether to load embedding layer.
             has_lm_head: Whether to load output head.
             dtype: Weight data type.
+            cache_base_path: Local path to pre-cached model weights.
 
         Returns:
             NodeStatus after loading.
@@ -259,6 +261,7 @@ class ActivationRouter:
             has_embedding=has_embedding,
             has_lm_head=has_lm_head,
             dtype=dtype,
+            cache_base_path=cache_base_path,
         )
 
         log.info(

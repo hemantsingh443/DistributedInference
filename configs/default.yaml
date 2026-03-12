@@ -32,6 +32,7 @@ coordinator:
   default_bandwidth_mbps: 1000.0
   default_latency_ms: 5.0
   memory_safety_margin: 0.9
+  model_cache_dir: "./model_cache"
 
 node:
   host: "localhost"

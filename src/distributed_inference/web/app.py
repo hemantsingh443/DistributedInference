@@ -73,6 +73,13 @@ class SwitchModelPayload(BaseModel):
     coordinator: str | None = None
 
 
+class CacheModelPayload(BaseModel):
+    """Payload for pre-caching model weights on the coordinator."""
+
+    model_name: str = Field(..., min_length=1)
+    coordinator: str | None = None
+
+
 class RunLogStore:
     """In-memory request-scoped event store with a fixed per-run cap."""
 

@@ -91,6 +91,28 @@ def _model_switch(args: argparse.Namespace) -> None:
         print(f"Model switch failed: {result.get('status', 'unknown error')}")
 
 
+def _cache(args: argparse.Namespace) -> None:
+    """Trigger model weight caching on the coordinator."""
+    url = f"{args.web_url.rstrip('/')}/api/model/cache"
+    payload = {"model_name": args.name}
+    print(f"Requesting coordinator to cache model '{args.name}'...")
+    print("This may take several minutes depending on model size and network speed.")
+    try:
+        response = requests.post(url, json=payload, timeout=610)  # > 10m gateway timeout
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to connect to web gateway: {e}")
+        return
+
+    if response.status_code == 200:
+        data = response.json()
+        if data.get("success"):
+            print(f"Success! Model cached at: {data.get('cache_path')}")
+        else:
+            print(f"Cache request failed: {data.get('status')}")
+    else:
+        print(f"Error caching model: {response.text}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Manage dynamic node onboarding via web gateway"
@@ -138,6 +160,13 @@ def main() -> None:
         help="Model name to switch to (e.g. Qwen/Qwen2-0.5B-Instruct)"
     )
     model_switch_parser.set_defaults(func=_model_switch)
+
+    model_cache_parser = subparsers.add_parser("model-cache", help="Pre-cache a model's weights on the coordinator")
+    model_cache_parser.add_argument(
+        "--name", type=str, required=True,
+        help="Model name to cache (e.g. Qwen/Qwen2-0.5B-Instruct)"
+    )
+    model_cache_parser.set_defaults(func=_cache)
 
     args = parser.parse_args()
     setup_logging(level=args.log_level, component="manage-cli")

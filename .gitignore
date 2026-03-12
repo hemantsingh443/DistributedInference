@@ -2,5 +2,4 @@
 venv
 __pycache__ 
 distributed_inference.egg-info  
-bugs.md 
-reviews.md
+model_cache

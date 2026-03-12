@@ -62,6 +62,8 @@ message NodeStatus {
 }
 
 // Shard assignment from coordinator to node
+
+// Shard assignment from coordinator to node
 message ShardAssignment {
   string model_name = 1;
   int32 start_layer = 2;
@@ -69,6 +71,7 @@ message ShardAssignment {
   bool has_embedding = 4;    // first node holds embedding layer
   bool has_lm_head = 5;      // last node holds lm_head
   string dtype = 6;          // "float16" or "float32"
+  string cache_base_path = 7; // local path to pre-cached model weights (optional)
 }
 
 // Registration acknowledgement
@@ -219,4 +222,17 @@ service CoordinatorService {
 
   // Client requests the cluster to dynamically switch models
   rpc SwitchModel(SwitchModelRequest) returns (SwitchModelResponse);
+
+  // Client requests the coordinator to pre-cache model weights
+  rpc CacheModel(CacheModelRequest) returns (CacheModelResponse);
+}
+
+message CacheModelRequest {
+  string model_name = 1;
+}
+
+message CacheModelResponse {
+  bool success = 1;
+  string cache_path = 2;
+  string message = 3;
 }
