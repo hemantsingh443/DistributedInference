@@ -41,16 +41,31 @@ class ModelCache:
     def is_cached(self, model_name: str) -> bool:
         """Check if a model's weights are already fully cached.
 
-        A model is considered cached if its directory exists and contains
-        at least one ``.safetensors`` file.
+        Verifies all shards listed in the safetensors index are present locally.
+        For non-sharded models, checks for a single ``model.safetensors``.
         """
         model_dir = self.get_cache_path(model_name)
         if not os.path.isdir(model_dir):
             return False
-        for fname in os.listdir(model_dir):
-            if fname.endswith(".safetensors"):
+
+        index_file = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            try:
+                import json
+                with open(index_file, "r", encoding="utf-8") as f:
+                    index_data = json.load(f)
+                weight_map = index_data.get("weight_map", {})
+                shard_files = set(weight_map.values())
+                for shard in shard_files:
+                    if not os.path.exists(os.path.join(model_dir, shard)):
+                        return False
                 return True
-        return False
+            except Exception as e:
+                log.warning(f"Error reading cache index {index_file}: {e}")
+                return False
+
+        # Fallback to single-file check
+        return os.path.exists(os.path.join(model_dir, "model.safetensors"))
 
     def ensure_cached(self, model_name: str) -> str:
         """Download model files to the local cache if not already present.
@@ -74,11 +89,13 @@ class ModelCache:
         os.makedirs(model_dir, exist_ok=True)
 
         # snapshot_download fetches all repo files into a local directory.
-        # We use local_dir to place files directly (no symlink indirection).
+        # We exclusively want safetensors, so we ignore other heavy weight formats
+        # to save bandwidth and disk space.
         snapshot_download(
             repo_id=model_name,
             local_dir=model_dir,
             local_dir_use_symlinks=False,
+            ignore_patterns=["*.bin", "*.bin.index.json", "*.pt", "*.h5", "*.msgpack"]
         )
 
         log.info(f"Model '{model_name}' cached successfully at {model_dir}")

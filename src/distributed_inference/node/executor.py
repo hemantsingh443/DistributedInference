@@ -146,6 +146,17 @@ class ShardExecutor:
                 for weight_key, shard_filename in weight_map.items():
                     if any(weight_key.startswith(p) for p in needed_prefixes):
                         shard_path = os.path.join(cache_base_path, shard_filename)
+                        
+                        # Fault tolerance: if a node expects a cached shard but it's
+                        # missing (e.g. incomplete centralized download), fall back.
+                        if not os.path.exists(shard_path):
+                            log.warning(f"Cache missing shard {shard_filename}, falling back to HF download")
+                            try:
+                                shard_path = hf_hub_download(model_name, shard_filename)
+                            except Exception as e:
+                                log.error(f"Failed to fetch fallback shard {shard_filename}: {e}")
+                                raise
+
                         if shard_path not in shard_files_needed:
                             shard_files_needed[shard_path] = {}
                         shard_files_needed[shard_path][weight_key] = weight_key
