@@ -5,8 +5,9 @@ handling serialization/deserialization and measuring per-hop latency.
 """
 
 import time
+import asyncio
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
+from typing import AsyncIterator, List, Optional, Tuple
 
 import grpc
 import torch
@@ -50,12 +51,12 @@ class ActivationRouter:
     def _get_stub(self, address: str) -> inference_pb2_grpc.NodeServiceStub:
         """Get or create a gRPC stub for a node address."""
         if address not in self._stubs:
-            channel = grpc.insecure_channel(address, options=self._grpc_options)
+            channel = grpc.aio.insecure_channel(address, options=self._grpc_options)
             self._channels[address] = channel
             self._stubs[address] = inference_pb2_grpc.NodeServiceStub(channel)
         return self._stubs[address]
 
-    def route_forward(
+    async def route_forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
@@ -79,7 +80,7 @@ class ActivationRouter:
         """
         per_hop_latency = []
         current_data: Optional[torch.Tensor] = None
-        for trace in self.route_forward_stream(
+        async for trace in self.route_forward_stream(
             input_ids=input_ids,
             attention_mask=attention_mask,
             execution_plan=execution_plan,
@@ -96,7 +97,7 @@ class ActivationRouter:
             raise RuntimeError("Execution plan has no stages")
         return current_data, per_hop_latency
 
-    def route_forward_stream(
+    async def route_forward_stream(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
@@ -106,7 +107,7 @@ class ActivationRouter:
         reset_cache: bool = False,
         cache_position: Optional[int] = None,
         is_prefill: bool = False,
-    ) -> Iterator[HopTrace]:
+    ) -> AsyncIterator[HopTrace]:
         """Route a forward pass and emit hop traces as they complete."""
         current_data = input_ids  # Start with input_ids
 
@@ -120,7 +121,7 @@ class ActivationRouter:
 
             stub = self._get_stub(stage.address)
 
-            hidden_data = serialize_tensor(current_data)
+            hidden_data = await asyncio.to_thread(serialize_tensor, current_data)
             activation = inference_pb2.ActivationData(
                 hidden_states=inference_pb2.TensorData(
                     data=hidden_data,
@@ -137,7 +138,7 @@ class ActivationRouter:
                 activation.cache_position = cache_position
 
             if attention_mask is not None:
-                mask_bytes = serialize_tensor(attention_mask)
+                mask_bytes = await asyncio.to_thread(serialize_tensor, attention_mask)
                 activation.attention_mask.CopyFrom(
                     inference_pb2.TensorData(
                         data=mask_bytes,
@@ -147,7 +148,7 @@ class ActivationRouter:
                 )
 
             try:
-                response = stub.RunForward(activation, timeout=120)
+                response = await stub.RunForward(activation, timeout=120)
             except grpc.RpcError as e:
                 log.error(
                     f"[bold red]Hop {i} FAILED[/] at {stage.node_id}: "
@@ -157,7 +158,7 @@ class ActivationRouter:
                     f"Forward pass failed at node {stage.node_id}: {e.details()}"
                 ) from e
 
-            current_data = deserialize_tensor(response.hidden_states.data)
+            current_data = await asyncio.to_thread(deserialize_tensor, response.hidden_states.data)
             hop_ms = (time.time() - hop_start) * 1000
 
             log.info(
@@ -172,7 +173,7 @@ class ActivationRouter:
                 hop_latency_ms=hop_ms,
             )
 
-    def clear_request_cache_on_pipeline(
+    async def clear_request_cache_on_pipeline(
         self,
         execution_plan: ExecutionPlan,
         request_id: str,
@@ -182,7 +183,7 @@ class ActivationRouter:
         for stage in execution_plan.stages:
             try:
                 stub = self._get_stub(stage.address)
-                stub.ClearRequestCache(
+                await stub.ClearRequestCache(
                     inference_pb2.CacheControl(
                         request_id=request_id,
                         clear_all=clear_all,
@@ -195,7 +196,7 @@ class ActivationRouter:
                     f"{e.code()} - {e.details()}"
                 )
 
-    def cancel_request_on_pipeline(
+    async def cancel_request_on_pipeline(
         self,
         execution_plan: ExecutionPlan,
         request_id: str,
@@ -205,7 +206,7 @@ class ActivationRouter:
             try:
                 stub = self._get_stub(stage.address)
                 if hasattr(stub, "CancelRequest"):
-                    stub.CancelRequest(
+                    await stub.CancelRequest(
                         inference_pb2.CacheControl(
                             request_id=request_id,
                             clear_all=False,
@@ -213,7 +214,7 @@ class ActivationRouter:
                         timeout=10,
                     )
                 else:
-                    stub.ClearRequestCache(
+                    await stub.ClearRequestCache(
                         inference_pb2.CacheControl(
                             request_id=request_id,
                             clear_all=False,
@@ -226,7 +227,7 @@ class ActivationRouter:
                     f"{e.code()} - {e.details()}"
                 )
 
-    def load_shard_on_node(
+    async def load_shard_on_node(
         self,
         address: str,
         model_name: str,
@@ -268,10 +269,10 @@ class ActivationRouter:
             f"Loading shard on {address}: layers [{start_layer}, {end_layer})"
         )
 
-        response = stub.LoadModelShard(assignment, timeout=600)
+        response = await stub.LoadModelShard(assignment, timeout=600)
         return response
 
-    def check_node_health(self, address: str) -> Optional[inference_pb2.NodeStatus]:
+    async def check_node_health(self, address: str) -> Optional[inference_pb2.NodeStatus]:
         """Send a heartbeat to check if a node is alive.
 
         Returns:
@@ -279,16 +280,16 @@ class ActivationRouter:
         """
         try:
             stub = self._get_stub(address)
-            response = stub.Heartbeat(inference_pb2.Empty(), timeout=5)
+            response = await stub.Heartbeat(inference_pb2.Empty(), timeout=5)
             return response.status
         except grpc.RpcError:
             return None
 
-    def unload_shard_on_node(self, address: str) -> Optional[inference_pb2.NodeStatus]:
+    async def unload_shard_on_node(self, address: str) -> Optional[inference_pb2.NodeStatus]:
         """Instruct a node to unload any currently loaded shard."""
         try:
             stub = self._get_stub(address)
-            return stub.UnloadShard(inference_pb2.Empty(), timeout=60)
+            return await stub.UnloadShard(inference_pb2.Empty(), timeout=60)
         except grpc.RpcError as e:
             log.warning(
                 f"Failed to unload shard on {address}: "
@@ -296,9 +297,9 @@ class ActivationRouter:
             )
             return None
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Close all gRPC channels."""
         for channel in self._channels.values():
-            channel.close()
+            await channel.close()
         self._channels.clear()
         self._stubs.clear()

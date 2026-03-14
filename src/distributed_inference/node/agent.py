@@ -9,7 +9,7 @@ Handles the full node lifecycle:
 6. Send periodic heartbeats
 """
 
-import threading
+import asyncio
 import time
 import uuid
 from typing import Optional
@@ -70,16 +70,16 @@ class NodeAgent:
         )
 
         self._running = False
-        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_interval = 5.0
         self._require_registration_success = require_registration_success
         self._last_registration_error = ""
         self._registered_with_coordinator = False
-        self._coord_lock = threading.RLock()
-        self._coord_channel: Optional[grpc.Channel] = None
+        self._coord_lock = asyncio.Lock()
+        self._coord_channel: Optional[grpc.aio.Channel] = None
         self._coord_stub: Optional[inference_pb2_grpc.CoordinatorServiceStub] = None
 
-    def start(self, block: bool = True) -> None:
+    async def start(self) -> None:
         """Start the node agent.
 
         Starts the gRPC server, registers with the coordinator,
@@ -95,51 +95,45 @@ class NodeAgent:
         log.info(f"Capabilities: {self.capabilities.summary()}")
 
         # Start gRPC server
-        self.server.start()
+        await self.server.start()
         self._running = True
         log.info(f"gRPC server started on port {self.port}")
 
         # Register with coordinator
-        registered = self._register_with_coordinator()
+        registered = await self._register_with_coordinator()
         if not registered and self._require_registration_success:
             reason = self._last_registration_error or "registration failed"
-            self.stop()
+            await self.stop()
             raise RuntimeError(
                 f"Initial registration failed (require_registration_success): {reason}"
             )
 
-        # Start heartbeat thread
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
+        # Start heartbeat task
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(),
             name=f"{self.node_id}-heartbeat",
         )
-        self._heartbeat_thread.start()
 
-        if block:
-            try:
-                self.server.wait_for_termination()
-            except KeyboardInterrupt:
-                self.stop()
-
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Stop the node agent gracefully."""
         log.info(f"Stopping node {self.node_id}")
         self._running = False
-        self.server.stop(grace=5)
-        self._close_coordinator_channel()
+        if getattr(self, "_heartbeat_task", None):
+            self._heartbeat_task.cancel()
+        await self.server.stop(grace=5)
+        await self._close_coordinator_channel()
         log.info(f"Node {self.node_id} stopped")
 
-    def _get_coordinator_stub(self) -> inference_pb2_grpc.CoordinatorServiceStub:
+    async def _get_coordinator_stub(self) -> inference_pb2_grpc.CoordinatorServiceStub:
         """Get or create a coordinator gRPC stub."""
-        with self._coord_lock:
+        async with self._coord_lock:
             if self._coord_stub is not None:
                 return self._coord_stub
             options = [
                 ("grpc.max_send_message_length", 256 * 1024 * 1024),
                 ("grpc.max_receive_message_length", 256 * 1024 * 1024),
             ]
-            self._coord_channel = grpc.insecure_channel(
+            self._coord_channel = grpc.aio.insecure_channel(
                 self.coordinator_address, options=options
             )
             self._coord_stub = inference_pb2_grpc.CoordinatorServiceStub(
@@ -147,16 +141,16 @@ class NodeAgent:
             )
             return self._coord_stub
 
-    def _close_coordinator_channel(self) -> None:
+    async def _close_coordinator_channel(self) -> None:
         """Close and reset the coordinator channel/stub."""
-        with self._coord_lock:
+        async with self._coord_lock:
             channel = self._coord_channel
             self._coord_stub = None
             self._coord_channel = None
         if channel is not None:
-            channel.close()
+            await channel.close()
 
-    def _register_with_coordinator(self) -> bool:
+    async def _register_with_coordinator(self) -> bool:
         """Register this node with the coordinator.
 
         Returns:
@@ -165,7 +159,7 @@ class NodeAgent:
         log.info(f"Registering with coordinator at {self.coordinator_address}")
 
         try:
-            stub = self._get_coordinator_stub()
+            stub = await self._get_coordinator_stub()
 
             node_info = inference_pb2.NodeInfo(
                 node_id=self.node_id,
@@ -180,7 +174,7 @@ class NodeAgent:
                 effective_bandwidth_mbps=self.capabilities.effective_bandwidth_mbps,
             )
 
-            response = stub.RegisterNode(node_info, timeout=10)
+            response = await stub.RegisterNode(node_info, timeout=10)
 
             if response.success:
                 log.info(
@@ -203,29 +197,29 @@ class NodeAgent:
         except grpc.RpcError as e:
             self._last_registration_error = f"{e.code().name}: {e.details()}"
             self._registered_with_coordinator = False
-            self._close_coordinator_channel()
+            await self._close_coordinator_channel()
             log.warning(
                 f"Could not reach coordinator: {e.code()} - {e.details()}"
             )
             log.info("Will retry registration on next heartbeat")
             return False
 
-    def _heartbeat_loop(self) -> None:
+    async def _heartbeat_loop(self) -> None:
         """Background thread sending periodic heartbeats to coordinator."""
         while self._running:
             try:
                 if not self._registered_with_coordinator:
-                    self._register_with_coordinator()
+                    await self._register_with_coordinator()
                 else:
-                    self._send_heartbeat()
+                    await self._send_heartbeat()
             except Exception as e:
                 log.warning(f"Heartbeat failed: {e}")
 
-            time.sleep(self._heartbeat_interval)
+            await asyncio.sleep(self._heartbeat_interval)
 
-    def _send_heartbeat(self) -> None:
+    async def _send_heartbeat(self) -> None:
         """Send a single heartbeat to the coordinator."""
-        stub = self._get_coordinator_stub()
+        stub = await self._get_coordinator_stub()
         from distributed_inference.node.resources import get_vram_usage_mb
 
         status = None
@@ -253,10 +247,10 @@ class NodeAgent:
             )
 
         try:
-            stub.ReportHealth(status, timeout=5)
+            await stub.ReportHealth(status, timeout=5)
         except grpc.RpcError as e:
             self._registered_with_coordinator = False
-            self._close_coordinator_channel()
+            await self._close_coordinator_channel()
             raise RuntimeError(
                 f"{e.code().name}: {e.details()}"
             ) from e

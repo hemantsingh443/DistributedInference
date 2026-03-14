@@ -1,5 +1,6 @@
 """Tests for orchestrator streaming inference events."""
 
+import pytest
 import torch
 
 from distributed_inference.coordinator.orchestrator import Orchestrator
@@ -46,7 +47,7 @@ class DummyRouter:
         self.route_calls = []
         self.cleared_requests = []
 
-    def route_forward_stream(
+    async def route_forward_stream(
         self,
         input_ids,
         attention_mask,
@@ -82,7 +83,7 @@ class DummyRouter:
             hop_latency_ms=8.0 + self.calls,
         )
 
-    def clear_request_cache_on_pipeline(self, execution_plan, request_id, clear_all=False):
+    async def clear_request_cache_on_pipeline(self, execution_plan, request_id, clear_all=False):
         del execution_plan, clear_all
         self.cleared_requests.append(request_id)
 
@@ -110,16 +111,17 @@ def _build_ready_orchestrator() -> Orchestrator:
     return orchestrator
 
 
-def test_run_inference_stream_emits_hops_tokens_and_completed():
+@pytest.mark.asyncio
+async def test_run_inference_stream_emits_hops_tokens_and_completed():
     orchestrator = _build_ready_orchestrator()
-    events = list(
+    events = [e async for e in 
         orchestrator.run_inference_stream(
             prompt="test",
             max_tokens=5,
             temperature=0.0,
             request_id="stream-1",
         )
-    )
+    ]
 
     kinds = [event.WhichOneof("payload") for event in events]
     assert kinds == ["hop", "token", "hop", "completed"]
@@ -141,9 +143,10 @@ def test_run_inference_stream_emits_hops_tokens_and_completed():
     assert completed.request_id == "stream-1"
 
 
-def test_run_inference_consumes_stream_and_returns_final_response():
+@pytest.mark.asyncio
+async def test_run_inference_consumes_stream_and_returns_final_response():
     orchestrator = _build_ready_orchestrator()
-    response = orchestrator.run_inference(
+    response = await orchestrator.run_inference(
         prompt="test",
         max_tokens=5,
         temperature=0.0,
@@ -157,18 +160,19 @@ def test_run_inference_consumes_stream_and_returns_final_response():
     assert len(response.per_hop_latency_ms) == 2
 
 
-def test_kv_cache_prefill_decode_and_cleanup_flow():
+@pytest.mark.asyncio
+async def test_kv_cache_prefill_decode_and_cleanup_flow():
     orchestrator = _build_ready_orchestrator()
     orchestrator.config.inference.enable_kv_cache = True
 
-    _ = list(
+    _ = [e async for e in
         orchestrator.run_inference_stream(
             prompt="test",
             max_tokens=3,
             temperature=0.0,
             request_id="stream-cache",
         )
-    )
+    ]
 
     assert len(orchestrator.router.route_calls) == 2
 

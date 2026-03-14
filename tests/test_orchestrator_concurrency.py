@@ -1,6 +1,6 @@
 """Tests for coordinator request concurrency, backpressure, and cancellation."""
 
-import threading
+import asyncio
 import time
 
 import pytest
@@ -48,14 +48,14 @@ class DummyTokenizer:
 class ControlledRouter:
     """Router stub with controllable pacing and cancellation hooks."""
 
-    def __init__(self, stage: PipelineStage, gate: threading.Event | None = None, delay_sec: float = 0.0):
+    def __init__(self, stage: PipelineStage, gate: asyncio.Event | None = None, delay_sec: float = 0.0):
         self.stage = stage
         self.gate = gate
         self.delay_sec = delay_sec
         self.route_calls = 0
         self.cancelled_requests: list[str] = []
 
-    def route_forward_stream(
+    async def route_forward_stream(
         self,
         input_ids,
         attention_mask,
@@ -71,9 +71,12 @@ class ControlledRouter:
 
         self.route_calls += 1
         if self.gate is not None:
-            self.gate.wait(timeout=2.0)
+            try:
+                await asyncio.wait_for(self.gate.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
         if self.delay_sec > 0:
-            time.sleep(self.delay_sec)
+            await asyncio.sleep(self.delay_sec)
 
         seq_len = input_ids.shape[1]
         logits = torch.zeros((1, seq_len, 8), dtype=torch.float32)
@@ -85,10 +88,10 @@ class ControlledRouter:
             hop_latency_ms=4.0,
         )
 
-    def clear_request_cache_on_pipeline(self, execution_plan, request_id, clear_all=False):
+    async def clear_request_cache_on_pipeline(self, execution_plan, request_id, clear_all=False):
         del execution_plan, request_id, clear_all
 
-    def cancel_request_on_pipeline(self, execution_plan, request_id):
+    async def cancel_request_on_pipeline(self, execution_plan, request_id):
         del execution_plan
         self.cancelled_requests.append(request_id)
 
@@ -108,7 +111,8 @@ def _build_ready_orchestrator(config: SystemConfig, router: ControlledRouter) ->
     return orchestrator
 
 
-def test_backpressure_rejects_when_queue_is_full():
+@pytest.mark.asyncio
+async def test_backpressure_rejects_when_queue_is_full():
     config = SystemConfig()
     config.inference.enable_kv_cache = False
     config.coordinator.max_concurrent_requests_global = 1
@@ -122,15 +126,15 @@ def test_backpressure_rejects_when_queue_is_full():
         has_embedding=True,
         has_lm_head=True,
     )
-    gate = threading.Event()
+    gate = asyncio.Event()
     router = ControlledRouter(stage=stage, gate=gate, delay_sec=0.0)
     orchestrator = _build_ready_orchestrator(config=config, router=router)
 
     results = {}
 
-    def _run(name: str, request_id: str):
+    async def _run(name: str, request_id: str):
         try:
-            results[name] = orchestrator.run_inference(
+            results[name] = await orchestrator.run_inference(
                 prompt="test",
                 max_tokens=1,
                 temperature=0.0,
@@ -139,28 +143,26 @@ def test_backpressure_rejects_when_queue_is_full():
         except Exception as e:  # pragma: no cover - assertion checks errors explicitly
             results[name] = e
 
-    t1 = threading.Thread(target=_run, args=("a", "req-a"), daemon=True)
-    t1.start()
+    t1 = asyncio.create_task(_run("a", "req-a"))
 
     deadline = time.time() + 2.0
     while router.route_calls == 0 and time.time() < deadline:
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
     assert router.route_calls >= 1
 
-    t2 = threading.Thread(target=_run, args=("b", "req-b"), daemon=True)
-    t2.start()
+    t2 = asyncio.create_task(_run("b", "req-b"))
 
     queued_deadline = time.time() + 2.0
     while time.time() < queued_deadline:
-        with orchestrator._state_lock:
+        async with orchestrator._state_lock:
             if orchestrator._queued_requests >= 1:
                 break
-        time.sleep(0.01)
-    with orchestrator._state_lock:
+        await asyncio.sleep(0.01)
+    async with orchestrator._state_lock:
         assert orchestrator._queued_requests >= 1
 
     with pytest.raises(RuntimeError, match="queue full"):
-        orchestrator.run_inference(
+        await orchestrator.run_inference(
             prompt="overflow",
             max_tokens=1,
             temperature=0.0,
@@ -168,15 +170,15 @@ def test_backpressure_rejects_when_queue_is_full():
         )
 
     gate.set()
-    t1.join(timeout=2.0)
-    t2.join(timeout=2.0)
+    await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
 
     assert "a" in results and "b" in results
     assert not isinstance(results["a"], Exception)
     assert not isinstance(results["b"], Exception)
 
 
-def test_cancel_inference_interrupts_running_stream():
+@pytest.mark.asyncio
+async def test_cancel_inference_interrupts_running_stream():
     config = SystemConfig()
     config.inference.enable_kv_cache = False
     config.coordinator.max_concurrent_requests_global = 2
@@ -195,36 +197,36 @@ def test_cancel_inference_interrupts_running_stream():
 
     captured = {"error": None}
 
-    def _stream():
+    async def _stream():
         try:
-            _ = list(
+            _ = [e async for e in 
                 orchestrator.run_inference_stream(
                     prompt="cancel-me",
                     max_tokens=25,
                     temperature=0.0,
                     request_id="cancel-1",
                 )
-            )
+            ]
         except Exception as e:  # pragma: no cover - asserted below
             captured["error"] = e
 
-    worker = threading.Thread(target=_stream, daemon=True)
-    worker.start()
+    worker = asyncio.create_task(_stream())
 
     deadline = time.time() + 2.0
-    while router.route_calls < 1 and time.time() < deadline:
-        time.sleep(0.01)
+    while router.route_calls == 0 and time.time() < deadline:
+        await asyncio.sleep(0.01)
     assert router.route_calls >= 1
 
-    assert orchestrator.cancel_inference("cancel-1", reason="unit-test") is True
-    worker.join(timeout=2.0)
+    assert await orchestrator.cancel_inference("cancel-1", reason="unit-test") is True
+    await asyncio.wait_for(worker, timeout=2.0)
 
     assert isinstance(captured["error"], RequestCancelledError)
     assert "cancel-1" in router.cancelled_requests
-    assert orchestrator.cancel_inference("cancel-1", reason="second-attempt") is False
+    assert await orchestrator.cancel_inference("cancel-1", reason="second-attempt") is False
 
 
-def test_supports_four_concurrent_active_requests():
+@pytest.mark.asyncio
+async def test_supports_four_concurrent_active_requests():
     config = SystemConfig()
     config.inference.enable_kv_cache = False
     config.coordinator.max_concurrent_requests_global = 4
@@ -238,14 +240,14 @@ def test_supports_four_concurrent_active_requests():
         has_embedding=True,
         has_lm_head=True,
     )
-    gate = threading.Event()
+    gate = asyncio.Event()
     router = ControlledRouter(stage=stage, gate=gate, delay_sec=0.0)
     orchestrator = _build_ready_orchestrator(config=config, router=router)
 
     results = {}
 
-    def _run(name: str):
-        results[name] = orchestrator.run_inference(
+    async def _run(name: str):
+        results[name] = await orchestrator.run_inference(
             prompt="test",
             max_tokens=1,
             temperature=0.0,
@@ -254,21 +256,20 @@ def test_supports_four_concurrent_active_requests():
 
     workers = []
     for idx in range(4):
-        worker = threading.Thread(target=_run, args=(str(idx),), daemon=True)
+        worker = asyncio.create_task(_run(str(idx)))
         workers.append(worker)
-        worker.start()
 
     deadline = time.time() + 2.0
     while time.time() < deadline:
-        with orchestrator._state_lock:
+        async with orchestrator._state_lock:
             if orchestrator._active_requests == 4:
                 break
-        time.sleep(0.01)
-    with orchestrator._state_lock:
+        await asyncio.sleep(0.01)
+    async with orchestrator._state_lock:
         assert orchestrator._active_requests == 4
 
     with pytest.raises(RuntimeError, match="queue full"):
-        orchestrator.run_inference(
+        await orchestrator.run_inference(
             prompt="overflow",
             max_tokens=1,
             temperature=0.0,
@@ -276,13 +277,13 @@ def test_supports_four_concurrent_active_requests():
         )
 
     gate.set()
-    for worker in workers:
-        worker.join(timeout=2.0)
+    await asyncio.wait_for(asyncio.gather(*workers), timeout=2.0)
 
     assert len(results) == 4
 
 
-def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
+@pytest.mark.asyncio
+async def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
     config = SystemConfig()
     config.inference.enable_kv_cache = False
     config.coordinator.enable_concurrent_scheduler = True
@@ -316,8 +317,11 @@ def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
         estimated_free_vram_mb=1800,
     )
 
+    if orchestrator._concurrent_scheduler is not None:
+        orchestrator._concurrent_scheduler.start()
+
     try:
-        events = list(
+        events = [e async for e in
             orchestrator.run_inference_stream(
                 prompt="test",
                 max_tokens=1,
@@ -325,10 +329,10 @@ def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
                 request_id="sched-1",
                 user_id="user-alpha",
             )
-        )
+        ]
     finally:
         if orchestrator._concurrent_scheduler is not None:
-            orchestrator._concurrent_scheduler.stop()
+            await orchestrator._concurrent_scheduler.stop()
 
     assert len(events) >= 2
     first = events[0]
@@ -338,7 +342,8 @@ def test_concurrent_scheduler_emits_event_metadata_and_user_fairness_fields():
     assert first.scheduler_retries >= 0
 
 
-def test_run_inference_stream_waits_for_model_readiness():
+@pytest.mark.asyncio
+async def test_run_inference_stream_waits_for_model_readiness():
     config = SystemConfig()
     config.inference.enable_kv_cache = False
     config.coordinator.ready_wait_timeout_sec = 0.5
@@ -354,14 +359,14 @@ def test_run_inference_stream_waits_for_model_readiness():
     )
     router = ControlledRouter(stage=stage, delay_sec=0.0)
     orchestrator = _build_ready_orchestrator(config=config, router=router)
-    with orchestrator._state_lock:
+    async with orchestrator._state_lock:
         orchestrator._model_loaded = False
         orchestrator._partition_plan = None
         orchestrator._execution_plan = None
 
-    def _mark_ready():
-        time.sleep(0.05)
-        with orchestrator._state_lock:
+    async def _mark_ready():
+        await asyncio.sleep(0.05)
+        async with orchestrator._state_lock:
             orchestrator._partition_plan = PartitionPlan(
                 assignments=[],
                 model_name="dummy",
@@ -373,16 +378,15 @@ def test_run_inference_stream_waits_for_model_readiness():
             )
             orchestrator._model_loaded = True
 
-    warmup = threading.Thread(target=_mark_ready, daemon=True)
-    warmup.start()
-    events = list(
+    warmup = asyncio.create_task(_mark_ready())
+    events = [e async for e in 
         orchestrator.run_inference_stream(
             prompt="warmup",
             max_tokens=1,
             temperature=0.0,
             request_id="warmup-req",
         )
-    )
-    warmup.join(timeout=1.0)
+    ]
+    await asyncio.wait_for(warmup, timeout=1.0)
 
     assert any(event.WhichOneof("payload") == "completed" for event in events)

@@ -1,9 +1,9 @@
 """Unit tests for the concurrent coordinator scheduler."""
 
-import threading
-import time
+import asyncio
 
 import pytest
+import pytest_asyncio
 
 from distributed_inference.coordinator.concurrent_scheduler import ConcurrentRequestScheduler
 from distributed_inference.coordinator.registry import NodeRegistry
@@ -47,7 +47,8 @@ def _build_registry() -> NodeRegistry:
     return registry
 
 
-def test_weighted_fair_dispatch_prevents_user_starvation():
+@pytest.mark.asyncio
+async def test_weighted_fair_dispatch_prevents_user_starvation():
     registry = _build_registry()
     scheduler = ConcurrentRequestScheduler(
         registry=registry,
@@ -59,53 +60,52 @@ def test_weighted_fair_dispatch_prevents_user_starvation():
         max_dispatch_per_tick=1,
     )
     plan = _build_execution_plan()
+    scheduler.start()
 
     order: list[str] = []
-    gate = threading.Event()
-    gate.clear()
+    gate = asyncio.Event()
 
-    first = scheduler.acquire(
+    first = await scheduler.acquire(
         request_id="req-a0",
         user_id="user-a",
         execution_plan=plan,
-        cancel_event=threading.Event(),
+        cancel_event=asyncio.Event(),
     )
     assert first.request_id == "req-a0"
 
-    def _worker(req_id: str, user_id: str):
-        ticket = scheduler.acquire(
+    async def _worker(req_id: str, user_id: str):
+        ticket = await scheduler.acquire(
             request_id=req_id,
             user_id=user_id,
             execution_plan=plan,
-            cancel_event=threading.Event(),
+            cancel_event=asyncio.Event(),
         )
         order.append(req_id)
-        gate.wait(timeout=2.0)
-        scheduler.release(req_id)
+        try:
+            await asyncio.wait_for(gate.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await scheduler.release(req_id)
         return ticket
 
-    t2 = threading.Thread(target=_worker, args=("req-a1", "user-a"), daemon=True)
-    t3 = threading.Thread(target=_worker, args=("req-a2", "user-a"), daemon=True)
-    t4 = threading.Thread(target=_worker, args=("req-b0", "user-b"), daemon=True)
-    t2.start()
-    t3.start()
-    t4.start()
+    t2 = asyncio.create_task(_worker("req-a1", "user-a"))
+    t3 = asyncio.create_task(_worker("req-a2", "user-a"))
+    t4 = asyncio.create_task(_worker("req-b0", "user-b"))
 
-    time.sleep(0.05)
-    scheduler.release("req-a0")
-    time.sleep(0.1)
+    await asyncio.sleep(0.05)
+    await scheduler.release("req-a0")
+    await asyncio.sleep(0.1)
     gate.set()
 
-    t2.join(timeout=2.0)
-    t3.join(timeout=2.0)
-    t4.join(timeout=2.0)
-    scheduler.stop()
+    await asyncio.wait_for(asyncio.gather(t2, t3, t4), timeout=2.0)
+    await scheduler.stop()
 
     assert "req-b0" in order
     assert order.index("req-b0") < order.index("req-a2")
 
 
-def test_queue_overflow_returns_retry_hint():
+@pytest.mark.asyncio
+async def test_queue_overflow_returns_retry_hint():
     registry = _build_registry()
     scheduler = ConcurrentRequestScheduler(
         registry=registry,
@@ -114,46 +114,50 @@ def test_queue_overflow_returns_retry_hint():
         scheduler_tick_ms=1,
     )
     plan = _build_execution_plan()
+    scheduler.start()
 
-    _ = scheduler.acquire(
+    _ = await scheduler.acquire(
         request_id="req-1",
         user_id="user",
         execution_plan=plan,
-        cancel_event=threading.Event(),
+        cancel_event=asyncio.Event(),
     )
 
-    holder_gate = threading.Event()
+    holder_gate = asyncio.Event()
 
-    def _queued_worker():
-        ticket = scheduler.acquire(
+    async def _queued_worker():
+        ticket = await scheduler.acquire(
             request_id="req-2",
             user_id="user",
             execution_plan=plan,
-            cancel_event=threading.Event(),
+            cancel_event=asyncio.Event(),
         )
-        holder_gate.wait(timeout=2.0)
-        scheduler.release("req-2")
+        try:
+            await asyncio.wait_for(holder_gate.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await scheduler.release("req-2")
         return ticket
 
-    queued_thread = threading.Thread(target=_queued_worker, daemon=True)
-    queued_thread.start()
-    time.sleep(0.05)
+    queued_task = asyncio.create_task(_queued_worker())
+    await asyncio.sleep(0.05)
 
     with pytest.raises(RuntimeError, match="queue full"):
-        scheduler.acquire(
+        await scheduler.acquire(
             request_id="req-3",
             user_id="user",
             execution_plan=plan,
-            cancel_event=threading.Event(),
+            cancel_event=asyncio.Event(),
         )
 
-    scheduler.release("req-1")
+    await scheduler.release("req-1")
     holder_gate.set()
-    queued_thread.join(timeout=2.0)
-    scheduler.stop()
+    await asyncio.wait_for(queued_task, timeout=2.0)
+    await scheduler.stop()
 
 
-def test_capacity_queues_and_waits_for_lane_to_free():
+@pytest.mark.asyncio
+async def test_capacity_queues_and_waits_for_lane_to_free():
     registry = _build_registry()
     # Saturate node lane capacity so scheduler cannot dispatch initially.
     registry.update_heartbeat(
@@ -173,25 +177,25 @@ def test_capacity_queues_and_waits_for_lane_to_free():
         node_max_concurrent_lanes=1,
     )
     plan = _build_execution_plan()
+    scheduler.start()
 
-    gate = threading.Event()
+    gate = asyncio.Event()
     acquired_ticket = []
 
-    def _requester():
-        ticket = scheduler.acquire(
+    async def _requester():
+        ticket = await scheduler.acquire(
             request_id="req-capacity",
             user_id="user",
             execution_plan=plan,
-            cancel_event=threading.Event(),
+            cancel_event=asyncio.Event(),
         )
         acquired_ticket.append(ticket)
         gate.set()
 
-    t = threading.Thread(target=_requester, daemon=True)
-    t.start()
+    t = asyncio.create_task(_requester())
 
     # Wait a bit to ensure it's blocked in the queue due to node saturation
-    time.sleep(0.5)
+    await asyncio.sleep(0.5)
     assert not gate.is_set()
 
     # Free up the node lane
@@ -204,8 +208,11 @@ def test_capacity_queues_and_waits_for_lane_to_free():
     )
 
     # Now it should be able to acquire
-    gate.wait(timeout=2.0)
+    try:
+        await asyncio.wait_for(gate.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pass
     assert gate.is_set()
     assert acquired_ticket[0].request_id == "req-capacity"
 
-    scheduler.stop()
+    await scheduler.stop()

@@ -57,12 +57,12 @@ class _FakeStub:
         self.report_calls = 0
         self.last_status = None
 
-    def RegisterNode(self, request, timeout=10):
+    async def RegisterNode(self, request, timeout=10):
         del request, timeout
         self.register_calls += 1
         return inference_pb2.RegistrationAck(success=True, message="ok")
 
-    def ReportHealth(self, status, timeout=5):
+    async def ReportHealth(self, status, timeout=5):
         del timeout
         self.report_calls += 1
         self.last_status = status
@@ -71,7 +71,8 @@ class _FakeStub:
         return inference_pb2.Empty()
 
 
-def test_heartbeat_failure_marks_node_unregistered(monkeypatch):
+@pytest.mark.asyncio
+async def test_heartbeat_failure_marks_node_unregistered(monkeypatch):
     fake_stub = _FakeStub()
 
     class _Caps:
@@ -115,16 +116,17 @@ def test_heartbeat_failure_marks_node_unregistered(monkeypatch):
         node_id="node-test",
     )
 
-    assert agent._register_with_coordinator() is True
+    assert (await agent._register_with_coordinator()) is True
     assert agent._registered_with_coordinator is True
 
     fake_stub.fail_report = True
     with pytest.raises(RuntimeError, match="NOT_FOUND"):
-        agent._send_heartbeat()
+        await agent._send_heartbeat()
     assert agent._registered_with_coordinator is False
 
 
-def test_heartbeat_reports_runtime_telemetry_from_node_servicer(monkeypatch):
+@pytest.mark.asyncio
+async def test_heartbeat_reports_runtime_telemetry_from_node_servicer(monkeypatch):
     fake_stub = _FakeStub()
 
     class _Caps:
@@ -169,9 +171,9 @@ def test_heartbeat_reports_runtime_telemetry_from_node_servicer(monkeypatch):
         device="cpu",
         node_id="node-test",
     )
-    assert agent._register_with_coordinator() is True
+    assert (await agent._register_with_coordinator()) is True
 
-    agent._send_heartbeat()
+    await agent._send_heartbeat()
 
     assert fake_stub.last_status is not None
     assert fake_stub.last_status.active_requests == 3

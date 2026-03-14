@@ -66,25 +66,32 @@ def main():
 
     setup_logging(level=args.log_level, component=f"node:{args.port}")
 
-    agent = NodeAgent(
-        port=args.port,
-        coordinator_address=args.coordinator,
-        max_vram_mb=args.max_vram_mb,
-        device=args.device,
-        node_id=args.node_id,
-        max_cached_requests=args.max_cached_requests,
-        max_concurrent_lanes=args.max_concurrent_lanes,
-        max_cache_tokens_per_request=args.max_cache_tokens,
-        bandwidth_mbps=args.bandwidth_mbps,
-        latency_ms=args.latency_ms,
-        require_registration_success=args.require_registration,
-    )
+    import asyncio
+    async def run_node():
+        agent = NodeAgent(
+            port=args.port,
+            coordinator_address=args.coordinator,
+            max_vram_mb=args.max_vram_mb,
+            device=args.device,
+            node_id=args.node_id,
+            max_cached_requests=args.max_cached_requests,
+            max_concurrent_lanes=args.max_concurrent_lanes,
+            max_cache_tokens_per_request=args.max_cache_tokens,
+            bandwidth_mbps=args.bandwidth_mbps,
+            latency_ms=args.latency_ms,
+            require_registration_success=args.require_registration,
+        )
+        try:
+            await agent.start()
+            try:
+                await agent.server.wait_for_termination()
+            except KeyboardInterrupt:
+                await agent.stop()
+        except RuntimeError as e:
+            print(f"Node startup failed: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    try:
-        agent.start(block=True)
-    except RuntimeError as e:
-        print(f"Node startup failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    asyncio.run(run_node())
 
 
 if __name__ == "__main__":

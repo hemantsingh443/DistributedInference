@@ -1,5 +1,7 @@
 """Tests for coordinator health-report handling edge cases."""
 
+import pytest
+
 from distributed_inference.coordinator.orchestrator import (
     CoordinatorServiceImpl,
     Orchestrator,
@@ -21,12 +23,13 @@ class DummyContext:
         self.details = details
 
 
-def test_report_health_rejects_unregistered_node():
+@pytest.mark.asyncio
+async def test_report_health_rejects_unregistered_node():
     orchestrator = Orchestrator()
     service = CoordinatorServiceImpl(orchestrator)
     context = DummyContext()
 
-    _ = service.ReportHealth(
+    _ = await service.ReportHealth(
         inference_pb2.NodeStatus(
             node_id="ghost-node",
             status=inference_pb2.NodeStatus.READY,

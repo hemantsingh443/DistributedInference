@@ -56,7 +56,9 @@ def _wait_for_web_health(web_url: str, timeout_sec: float) -> None:
     raise RuntimeError(f"Timed out waiting for web health at {health_url}")
 
 
-def main() -> None:
+import asyncio
+
+async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Start web stack with runtime node onboarding controls"
     )
@@ -97,8 +99,8 @@ def main() -> None:
 
     try:
         log.info(f"[bold blue]Starting coordinator[/] on {coordinator_addr}")
-        orchestrator.start(block=False)
-        time.sleep(1.0)
+        await orchestrator.start()
+        await asyncio.sleep(1.0)
 
         log.info(f"[bold magenta]Starting web gateway[/] on {web_url}")
         web_cmd = [
@@ -138,12 +140,12 @@ def main() -> None:
                     "Started node via web API: "
                     f"{response.get('node_id')} (pid={response.get('pid')})"
                 )
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
 
-            if not orchestrator.wait_for_nodes(args.initial_nodes, timeout=args.startup_timeout):
+            if not await orchestrator.wait_for_nodes(args.initial_nodes, timeout=args.startup_timeout):
                 raise RuntimeError("Initial nodes did not register in time")
             log.info("Running initial model setup across registered nodes")
-            orchestrator.setup_model()
+            await orchestrator.setup_model()
 
         print("\nDynamic onboarding commands:")
         print(f"  List nodes: python -m distributed_inference.cli.manage_nodes --web-url {web_url} list")
@@ -166,12 +168,14 @@ def main() -> None:
         while True:
             if web_proc.poll() is not None:
                 raise RuntimeError("Web gateway exited unexpectedly")
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     except urllib.error.URLError as e:
         log.error(f"Web API error: {e}")
     except KeyboardInterrupt:
         log.info("Interrupted, shutting down...")
+    except asyncio.CancelledError:
+        pass
     finally:
         if web_proc is not None:
             web_proc.terminate()
@@ -179,9 +183,12 @@ def main() -> None:
                 web_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 web_proc.kill()
-        orchestrator.stop()
+        await orchestrator.stop()
         log.info("[bold green]Stopped all services[/]")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

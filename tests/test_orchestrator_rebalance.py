@@ -1,5 +1,8 @@
 """Tests for orchestrator rebalance failure handling."""
 
+import asyncio
+import pytest
+
 from distributed_inference.common.config import SystemConfig
 from distributed_inference.coordinator.orchestrator import NodeLoadError, Orchestrator
 from distributed_inference.coordinator.partitioner import LayerAssignment, PartitionPlan
@@ -7,7 +10,8 @@ from distributed_inference.coordinator.registry import NodeState
 from distributed_inference.coordinator.scheduler import ExecutionPlan
 
 
-def test_rebalance_load_failure_keeps_viable_old_plan(monkeypatch):
+@pytest.mark.asyncio
+async def test_rebalance_load_failure_keeps_viable_old_plan(monkeypatch):
     config = SystemConfig()
     orchestrator = Orchestrator(config=config)
     orchestrator._running = True
@@ -41,30 +45,37 @@ def test_rebalance_load_failure_keeps_viable_old_plan(monkeypatch):
     )
     new_exec = ExecutionPlan(stages=[], estimated_total_ms=2.0)
 
-    monkeypatch.setattr(orchestrator, "_wait_for_drain", lambda timeout_sec: True)
-    monkeypatch.setattr(orchestrator, "_get_rebalance_candidate_nodes", lambda: [node])
-    monkeypatch.setattr(orchestrator.router, "check_node_health", lambda address: object())
+    async def mock_wait_for_drain(timeout_sec):
+        return True
+    
+    async def mock_load_partition_plan(plan):
+        raise NodeLoadError("node-1", "simulated shard load failure")
+
+    async def mock_get_candidates():
+        return [node]
+
+    async def mock_health(address, timeout_sec=2.0):
+        return object()
+
+    monkeypatch.setattr(orchestrator, "_wait_for_drain", mock_wait_for_drain)
+    monkeypatch.setattr(orchestrator, "_get_rebalance_candidate_nodes", mock_get_candidates)
+    monkeypatch.setattr(orchestrator.router, "check_node_health", mock_health)
     monkeypatch.setattr(
         "distributed_inference.coordinator.orchestrator.partition_model",
         lambda **kwargs: new_plan,
     )
     monkeypatch.setattr(orchestrator.scheduler, "create_execution_plan", lambda plan: new_exec)
-    monkeypatch.setattr(
-        orchestrator,
-        "_load_partition_plan",
-        lambda plan: (_ for _ in ()).throw(
-            NodeLoadError("node-1", "simulated shard load failure")
-        ),
-    )
+    monkeypatch.setattr(orchestrator, "_load_partition_plan", mock_load_partition_plan)
 
-    ok = orchestrator._rebalance_pipeline("topology:register")
+    ok = await orchestrator._rebalance_pipeline("topology:register")
     assert ok is False
     assert orchestrator._partition_plan is old_plan
     assert orchestrator._execution_plan is old_exec
     assert orchestrator._model_loaded is True
 
 
-def test_resource_load_error_sets_backoff_without_marking_dead(monkeypatch):
+@pytest.mark.asyncio
+async def test_resource_load_error_sets_backoff_without_marking_dead(monkeypatch):
     orchestrator = Orchestrator()
     node = orchestrator.registry.register(
         node_id="node-1",
@@ -85,12 +96,16 @@ def test_resource_load_error_sets_backoff_without_marking_dead(monkeypatch):
     assert updated.state == NodeState.IDLE
     assert "node-1" in orchestrator._node_load_backoff_until
 
-    monkeypatch.setattr(orchestrator.router, "check_node_health", lambda address: object())
-    candidates = orchestrator._get_rebalance_candidate_nodes()
+    async def mock_health(address, timeout_sec=2.0):
+        return object()
+
+    monkeypatch.setattr(orchestrator.router, "check_node_health", mock_health)
+    candidates = await orchestrator._get_rebalance_candidate_nodes()
     assert candidates == []
 
 
-def test_load_partition_plan_skips_unchanged_assignment(monkeypatch):
+@pytest.mark.asyncio
+async def test_load_partition_plan_skips_unchanged_assignment(monkeypatch):
     orchestrator = Orchestrator()
     node = orchestrator.registry.register(
         node_id="node-1",
@@ -117,12 +132,18 @@ def test_load_partition_plan_skips_unchanged_assignment(monkeypatch):
     )
 
     calls = {"loads": 0}
-    monkeypatch.setattr(orchestrator.router, "check_node_health", lambda address: object())
+    async def mock_health(address, timeout_sec=2.0):
+        return object()
+
+    async def mock_load_shard_on_node(**kwargs):
+        calls["loads"] += 1
+
+    monkeypatch.setattr(orchestrator.router, "check_node_health", mock_health)
     monkeypatch.setattr(
         orchestrator.router,
         "load_shard_on_node",
-        lambda **kwargs: calls.__setitem__("loads", calls["loads"] + 1),
+        mock_load_shard_on_node,
     )
 
-    orchestrator._load_partition_plan(plan)
+    await orchestrator._load_partition_plan(plan)
     assert calls["loads"] == 0

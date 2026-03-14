@@ -7,7 +7,7 @@ Implements the NodeService defined in inference.proto. Handles:
 """
 
 import time
-import threading
+import asyncio
 from concurrent import futures
 
 import grpc
@@ -53,33 +53,40 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
         )
         self._status = inference_pb2.NodeStatus.IDLE
         self._vram_total_mb = 0
-        self._status_lock = threading.RLock()
-        self._lane_semaphore = threading.BoundedSemaphore(self.max_concurrent_lanes)
+        self._status_lock = asyncio.Lock()
+        self._lane_semaphore = asyncio.BoundedSemaphore(self.max_concurrent_lanes)
         self._active_requests = 0
         self._queue_depth = 0
         self._cancelled_requests: set[str] = set()
 
-    def _set_status(self, status: int) -> None:
-        with self._status_lock:
+    async def _set_status(self, status: int) -> None:
+        async with self._status_lock:
             self._status = status
 
-    def _get_status(self) -> int:
-        with self._status_lock:
+    async def _get_status(self) -> int:
+        async with self._status_lock:
             return self._status
 
-    def _try_acquire_lane(self, timeout_sec: float = 30.0) -> bool:
-        with self._status_lock:
+    async def _try_acquire_lane(self, timeout_sec: float = 30.0) -> bool:
+        async with self._status_lock:
             self._queue_depth += 1
-        acquired = self._lane_semaphore.acquire(timeout=timeout_sec)
-        with self._status_lock:
+        
+        try:
+            # wait_for raises TimeoutError if it times out
+            await asyncio.wait_for(self._lane_semaphore.acquire(), timeout=timeout_sec)
+            acquired = True
+        except asyncio.TimeoutError:
+            acquired = False
+
+        async with self._status_lock:
             self._queue_depth = max(self._queue_depth - 1, 0)
             if acquired:
                 self._active_requests += 1
                 self._status = inference_pb2.NodeStatus.BUSY
         return acquired
 
-    def _release_lane(self) -> None:
-        with self._status_lock:
+    async def _release_lane(self) -> None:
+        async with self._status_lock:
             self._active_requests = max(self._active_requests - 1, 0)
             if self._active_requests == 0:
                 self._status = (
@@ -89,7 +96,7 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 )
         self._lane_semaphore.release()
 
-    def LoadModelShard(self, request, context):
+    async def LoadModelShard(self, request, context):
         """Load model shard as instructed by the coordinator."""
         log.info(
             f"[bold green]LoadModelShard[/] request: "
@@ -98,10 +105,11 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
             f"embed={request.has_embedding}, lm_head={request.has_lm_head}"
         )
 
-        self._set_status(inference_pb2.NodeStatus.LOADING)
+        await self._set_status(inference_pb2.NodeStatus.LOADING)
 
         try:
-            stats = self.executor.load_shard(
+            stats = await asyncio.to_thread(
+                self.executor.load_shard,
                 model_name=request.model_name,
                 start_layer=request.start_layer,
                 end_layer=request.end_layer,
@@ -110,28 +118,28 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 dtype=request.dtype or "float16",
                 cache_base_path=getattr(request, "cache_base_path", ""),
             )
-            self._set_status(inference_pb2.NodeStatus.READY)
+            await self._set_status(inference_pb2.NodeStatus.READY)
             self._vram_total_mb = stats.get("vram_used_mb", 0)
 
-            return self._build_status()
+            return await self._build_status()
 
         except Exception as e:
             log.error(f"Failed to load shard: {e}")
-            self._set_status(inference_pb2.NodeStatus.ERROR)
+            await self._set_status(inference_pb2.NodeStatus.ERROR)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return self._build_status()
+            return await self._build_status()
 
-    def RunForward(self, request, context):
+    async def RunForward(self, request, context):
         """Execute forward pass on the loaded shard."""
         start_time = time.time()
         request_id = request.request_id or ""
 
         if request.reset_cache and request_id:
-            with self._status_lock:
+            async with self._status_lock:
                 self._cancelled_requests.discard(request_id)
 
-        with self._status_lock:
+        async with self._status_lock:
             if request_id and request_id in self._cancelled_requests:
                 if context is not None:
                     context.set_code(grpc.StatusCode.CANCELLED)
@@ -139,11 +147,11 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 return inference_pb2.ActivationData()
 
         # Bug 9 Fix: LRU Cache Eviction Data Loss (Admission Control)
-        # Prevent the node from taking on more NEW requests than it can physically cache,
-        # which would force it to silently evict and destroy generation state for active users.
         if request.is_prefill and request.use_cache:
-            with self.executor._cache_lock:
-                current_cache_count = len(self.executor._kv_cache_by_request)
+            def check_cache_slots():
+                with self.executor._cache_lock:
+                    return len(self.executor._kv_cache_by_request)
+            current_cache_count = await asyncio.to_thread(check_cache_slots)
             if current_cache_count >= self.executor.max_cached_requests:
                 if context is not None:
                     context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
@@ -152,46 +160,34 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                     )
                 return inference_pb2.ActivationData()
 
-        if not self._try_acquire_lane():
+        if not await self._try_acquire_lane():
             if context is not None:
                 context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
                 context.set_details("node forward lanes are saturated")
             return inference_pb2.ActivationData()
 
         # Bug 7 Fix: Thread Starvation
-        # Re-check cancellation AFTER bridging the semaphore. If was cancelled while waiting,
-        # immediately drop it rather than processing the heavy PyTorch forward pass.
-        with self._status_lock:
+        async with self._status_lock:
             if request_id and request_id in self._cancelled_requests:
-                self._release_lane()
+                await self._release_lane()
                 if context is not None:
                     context.set_code(grpc.StatusCode.CANCELLED)
                     context.set_details(f"request {request_id} was cancelled while in queue")
                 return inference_pb2.ActivationData()
 
         try:
-            # Deserialize input tensors
-            hidden_states = deserialize_tensor(
-                request.hidden_states.data,
-                device=self.device_type,
-            )
+            # Deserialize input tensors offloaded to thread pool
+            def _deserialize_inputs():
+                h = deserialize_tensor(request.hidden_states.data, device=self.device_type)
+                a = deserialize_tensor(request.attention_mask.data, device=self.device_type) if request.attention_mask.data else None
+                p = deserialize_tensor(request.position_ids.data, device=self.device_type) if request.position_ids.data else None
+                return h, a, p
+                
+            hidden_states, attention_mask, position_ids = await asyncio.to_thread(_deserialize_inputs)
 
-            attention_mask = None
-            if request.attention_mask.data:
-                attention_mask = deserialize_tensor(
-                    request.attention_mask.data,
-                    device=self.device_type,
-                )
-
-            position_ids = None
-            if request.position_ids.data:
-                position_ids = deserialize_tensor(
-                    request.position_ids.data,
-                    device=self.device_type,
-                )
-
-            # Run forward pass
-            output = self.executor.forward(
+            # Run forward pass (offloaded)
+            output = await asyncio.to_thread(
+                self.executor.forward,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -202,8 +198,8 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
                 is_prefill=request.is_prefill,
             )
 
-            # Serialize output
-            output_bytes = serialize_tensor(output)
+            # Serialize output (offloaded)
+            output_bytes = await asyncio.to_thread(serialize_tensor, output)
             elapsed_ms = (time.time() - start_time) * 1000
 
             log.info(
@@ -214,9 +210,6 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
             )
 
             # Bug 10 Fix: Explicit Tensor Memory Deallocation
-            # Python's GC is often too slow to drop these references implicitly before the 
-            # gRPC Servicer thread ends, meaning the next request hits OOM on the CUDA allocator. 
-            # We explicitly destroy the python references linking to the C++ graphical engine now.
             output_shape = list(output.shape)
             output_dtype = str(output.dtype).replace("torch.", "")
             del hidden_states
@@ -244,56 +237,56 @@ class NodeServiceImpl(inference_pb2_grpc.NodeServiceServicer):
             raise
         except Exception as e:
             log.error(f"Forward pass failed: {e}")
-            self._set_status(inference_pb2.NodeStatus.ERROR)
+            await self._set_status(inference_pb2.NodeStatus.ERROR)
             if context is not None:
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(str(e))
             return inference_pb2.ActivationData()
         finally:
-            self._release_lane()
+            await self._release_lane()
 
-    def Heartbeat(self, request, context):
+    async def Heartbeat(self, request, context):
         """Respond to health check with current status."""
         return inference_pb2.HeartbeatResponse(
-            status=self._build_status()
+            status=await self._build_status()
         )
 
-    def UnloadShard(self, request, context):
+    async def UnloadShard(self, request, context):
         """Unload the current model shard."""
         log.info("Unloading shard")
-        self.executor.unload()
-        self._set_status(inference_pb2.NodeStatus.IDLE)
-        return self._build_status()
+        await asyncio.to_thread(self.executor.unload)
+        await self._set_status(inference_pb2.NodeStatus.IDLE)
+        return await self._build_status()
 
-    def ClearRequestCache(self, request, context):
+    async def ClearRequestCache(self, request, context):
         """Clear cache state for one request or all requests."""
         if request.clear_all:
-            self.executor.clear_all_cache()
-            with self._status_lock:
+            await asyncio.to_thread(self.executor.clear_all_cache)
+            async with self._status_lock:
                 self._cancelled_requests.clear()
         elif request.request_id:
-            self.executor.clear_request_cache(request.request_id)
+            await asyncio.to_thread(self.executor.clear_request_cache, request.request_id)
         return inference_pb2.Empty()
 
-    def CancelRequest(self, request, context):
+    async def CancelRequest(self, request, context):
         """Cancel an in-flight request and clear its cache."""
         if request.clear_all:
-            self.executor.clear_all_cache()
-            with self._status_lock:
+            await asyncio.to_thread(self.executor.clear_all_cache)
+            async with self._status_lock:
                 self._cancelled_requests.clear()
             return inference_pb2.Empty()
 
         if request.request_id:
-            self.executor.clear_request_cache(request.request_id)
-            with self._status_lock:
+            await asyncio.to_thread(self.executor.clear_request_cache, request.request_id)
+            async with self._status_lock:
                 self._cancelled_requests.add(request.request_id)
         return inference_pb2.Empty()
 
-    def _build_status(self) -> inference_pb2.NodeStatus:
+    async def _build_status(self) -> inference_pb2.NodeStatus:
         """Build a NodeStatus protobuf message."""
         layer_info = self.executor.get_layer_info()
         assigned = list(range(layer_info["start_layer"], layer_info["end_layer"]))
-        with self._status_lock:
+        async with self._status_lock:
             active_requests = self._active_requests
             queue_depth = self._queue_depth
             status = self._status
@@ -323,14 +316,14 @@ def create_node_server(
     max_cache_tokens_per_request: int = 4096,
     max_concurrent_lanes: int = 4,
     max_workers: int = 4,
-) -> grpc.Server:
-    """Create and configure a gRPC server for the node.
+) -> grpc.aio.Server:
+    """Create and configure a gRPC aio server for the node.
 
     Args:
         node_id: Unique identifier for this node.
         port: Port to listen on.
         device_type: Device type for inference ("cuda" or "cpu").
-        max_workers: Max thread pool workers for gRPC.
+        max_workers: Unused by grpc.aio but kept for API stability.
 
     Returns:
         Configured (but not yet started) gRPC server.
@@ -341,10 +334,7 @@ def create_node_server(
         ("grpc.max_receive_message_length", 256 * 1024 * 1024),
     ]
 
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max_workers),
-        options=options,
-    )
+    server = grpc.aio.server(options=options)
 
     servicer = NodeServiceImpl(
         node_id=node_id,
@@ -361,3 +351,4 @@ def create_node_server(
 
     log.info(f"Node server configured on port {port}")
     return server
+

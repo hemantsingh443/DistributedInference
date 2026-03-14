@@ -59,22 +59,27 @@ def main():
     if args.enable_concurrent_scheduler:
         config.coordinator.enable_concurrent_scheduler = True
 
-    orchestrator = Orchestrator(config=config)
+    import asyncio
 
-    if args.auto_setup:
-        # Start non-blocking, wait for nodes, then set up model
-        orchestrator.start(block=False)
+    async def run_coordinator():
+        orchestrator = Orchestrator(config=config)
+        if args.auto_setup:
+            await orchestrator.start()
+            if await orchestrator.wait_for_nodes(args.min_nodes, timeout=120):
+                await orchestrator.setup_model()
+            
+            try:
+                await orchestrator._server.wait_for_termination()
+            except KeyboardInterrupt:
+                await orchestrator.stop()
+        else:
+            await orchestrator.start()
+            try:
+                await orchestrator._server.wait_for_termination()
+            except KeyboardInterrupt:
+                await orchestrator.stop()
 
-        if orchestrator.wait_for_nodes(args.min_nodes, timeout=120):
-            orchestrator.setup_model()
-
-        # Now block
-        try:
-            orchestrator._server.wait_for_termination()
-        except KeyboardInterrupt:
-            orchestrator.stop()
-    else:
-        orchestrator.start(block=True)
+    asyncio.run(run_coordinator())
 
 
 if __name__ == "__main__":

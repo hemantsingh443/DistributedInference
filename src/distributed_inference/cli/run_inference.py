@@ -1,6 +1,7 @@
 """CLI entry point for submitting an inference request."""
 
 import argparse
+import asyncio
 import sys
 import uuid
 
@@ -13,10 +14,10 @@ from distributed_inference.proto import inference_pb2_grpc
 log = get_logger(__name__)
 
 
-def _run_unary(stub, request):
+async def _run_unary(stub, request):
     """Submit a blocking unary inference request."""
     try:
-        response = stub.SubmitInference(request, timeout=300)
+        response = await stub.SubmitInference(request, timeout=300)
 
         print("\n" + "=" * 60)
         print("GENERATED TEXT:")
@@ -35,7 +36,7 @@ def _run_unary(stub, request):
         sys.exit(1)
 
 
-def _run_stream(stub, request):
+async def _run_stream(stub, request):
     """Submit a streaming inference request and print tokens as they arrive."""
     try:
         stream = stub.SubmitInferenceStream(request, timeout=300)
@@ -45,7 +46,7 @@ def _run_stream(stub, request):
         print("=" * 60)
 
         final_response = None
-        for event in stream:
+        async for event in stream:
             if event.HasField("token"):
                 sys.stdout.write(event.token.token_text)
                 sys.stdout.flush()
@@ -117,25 +118,29 @@ def main():
         ("grpc.max_send_message_length", 256 * 1024 * 1024),
         ("grpc.max_receive_message_length", 256 * 1024 * 1024),
     ]
-    channel = grpc.insecure_channel(args.coordinator, options=options)
-    stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
+    
+    async def run():
+        channel = grpc.aio.insecure_channel(args.coordinator, options=options)
+        stub = inference_pb2_grpc.CoordinatorServiceStub(channel)
 
-    request = inference_pb2.InferenceRequest(
-        request_id=uuid.uuid4().hex[:8],
-        prompt=args.prompt,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        user_id=args.user_id,
-    )
+        request = inference_pb2.InferenceRequest(
+            request_id=uuid.uuid4().hex[:8],
+            prompt=args.prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            user_id=args.user_id,
+        )
 
-    log.info(f"Sending inference request: '{args.prompt[:50]}...'")
+        log.info(f"Sending inference request: '{args.prompt[:50]}...'")
 
-    if args.stream:
-        _run_stream(stub, request)
-    else:
-        _run_unary(stub, request)
+        if args.stream:
+            await _run_stream(stub, request)
+        else:
+            await _run_unary(stub, request)
+            
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

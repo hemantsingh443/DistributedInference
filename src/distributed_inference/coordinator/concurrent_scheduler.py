@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -30,7 +30,7 @@ class _PendingRequest:
     request_id: str
     user_id: str
     execution_plan: ExecutionPlan
-    cancel_event: threading.Event
+    cancel_event: asyncio.Event
     queued_at: float = field(default_factory=time.time)
     next_eligible_at: float = field(default_factory=time.time)
     dispatch_retries: int = 0
@@ -85,47 +85,60 @@ class ConcurrentRequestScheduler:
         self._pending_by_user: dict[str, deque[_PendingRequest]] = {}
         self._user_round_robin: deque[str] = deque()
 
-        self._lock = threading.RLock()
-        self._cond = threading.Condition(self._lock)
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._dispatch_loop,
-            daemon=True,
-            name="concurrent-request-scheduler",
-        )
-        self._thread.start()
+        self._lock = None
+        self._cond = None
+        self._running = False
+        self._dispatch_task = None
 
-    def stop(self) -> None:
+    def start(self) -> None:
+        """Start scheduler dispatch task in the active asyncio loop."""
+        self._lock = asyncio.Lock()
+        self._cond = asyncio.Condition(self._lock)
+        self._running = True
+        self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+
+    async def stop(self) -> None:
         """Stop scheduler dispatch thread."""
-        with self._lock:
+        if not self._running or self._lock is None:
+            return
+        async with self._lock:
             self._running = False
             self._cond.notify_all()
-        self._thread.join(timeout=2.0)
+        if self._dispatch_task:
+            self._dispatch_task.cancel()
 
-    def set_accepting(self, accepting: bool) -> None:
-        with self._lock:
+    async def set_accepting(self, accepting: bool) -> None:
+        if self._lock is None:
+            self._accepting = bool(accepting)
+            return
+        async with self._lock:
             self._accepting = bool(accepting)
             self._cond.notify_all()
 
-    @property
-    def active_count(self) -> int:
-        with self._lock:
+    async def get_active_count(self) -> int:
+        if self._lock is None:
+            return self._active
+        async with self._lock:
             return self._active
 
-    @property
-    def queue_depth(self) -> int:
-        with self._lock:
+    async def get_queue_depth(self) -> int:
+        if self._lock is None:
+            return self._queued
+        async with self._lock:
             return self._queued
 
-    def acquire(
+    async def acquire(
         self,
         *,
         request_id: str,
         user_id: str,
         execution_plan: ExecutionPlan,
-        cancel_event: threading.Event,
+        cancel_event: asyncio.Event,
     ) -> SchedulerTicket:
         """Queue request and block until scheduler dispatches it."""
+        if self._lock is None:
+            raise RuntimeError("Scheduler not started. Call start() first.")
+
         user_bucket = (user_id or request_id or "anonymous").strip() or "anonymous"
         pending = _PendingRequest(
             request_id=request_id,
@@ -134,7 +147,7 @@ class ConcurrentRequestScheduler:
             cancel_event=cancel_event,
         )
 
-        with self._lock:
+        async with self._lock:
             if not self._accepting:
                 raise RuntimeError("Coordinator is rebalancing; retry shortly")
             if request_id in self._pending_by_request:
@@ -167,11 +180,16 @@ class ConcurrentRequestScheduler:
                     raise RuntimeError(
                         f"request {request_id} cancelled before dispatch"
                     )
-                self._cond.wait(timeout=self.tick_sec)
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=self.tick_sec)
+                except asyncio.TimeoutError:
+                    pass
 
-    def release(self, request_id: str) -> None:
+    async def release(self, request_id: str) -> None:
         """Release one active scheduler slot for a completed request."""
-        with self._lock:
+        if self._lock is None:
+            return
+        async with self._lock:
             self._active = max(self._active - 1, 0)
             self._emit_metrics_locked()
             self._cond.notify_all()
@@ -217,9 +235,11 @@ class ConcurrentRequestScheduler:
                     uid for uid in self._user_round_robin if uid != pending.user_id
                 )
 
-    def _dispatch_loop(self) -> None:
+    async def _dispatch_loop(self) -> None:
+        if self._lock is None:
+            return
         while True:
-            with self._lock:
+            async with self._lock:
                 if not self._running:
                     return
 
@@ -278,7 +298,14 @@ class ConcurrentRequestScheduler:
                     self._cond.notify_all()
                     dispatched += 1
 
-                self._cond.wait(timeout=self.tick_sec if dispatched == 0 else 0.0)
+                try:
+                    wait_time = self.tick_sec if dispatched == 0 else 0.0
+                    if wait_time > 0:
+                        await asyncio.wait_for(self._cond.wait(), timeout=wait_time)
+                    else:
+                        await asyncio.sleep(0) # Yield control
+                except asyncio.TimeoutError:
+                    pass
 
     def _select_next_pending_locked(self, now: float) -> Optional[_PendingRequest]:
         if self._queued <= 0:

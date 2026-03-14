@@ -7,12 +7,12 @@ Manages the full lifecycle of the coordinator:
 - Node health monitoring
 """
 
-import threading
+import asyncio
 import time
 import uuid
 from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import AsyncIterator, Optional
 
 import grpc
 import torch
@@ -76,7 +76,7 @@ class RequestContext:
     lane_id: int = 0
     state: str = "QUEUED"
     cancel_reason: str = ""
-    cancel_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     
     # Bug 2 Fix: Preserve the specific route diagram this request was launched with,
     # so cancellation always reaches the correct nodes even after a cluster rebalance.
@@ -92,7 +92,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
     def __init__(self, orchestrator: "Orchestrator"):
         self.orchestrator = orchestrator
 
-    def RegisterNode(self, request, context):
+    async def RegisterNode(self, request, context):
         """Handle node registration."""
         decision = self.orchestrator.admission.evaluate(
             vram_mb=request.vram_mb,
@@ -137,7 +137,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             rebalance_plan_version=self.orchestrator.plan_version,
         )
 
-    def ReportHealth(self, request, context):
+    async def ReportHealth(self, request, context):
         """Handle health reports from nodes."""
         if self.orchestrator.registry.get_node(request.node_id) is None:
             context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -154,7 +154,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
         )
         return inference_pb2.Empty()
 
-    def SubmitInference(self, request, context):
+    async def SubmitInference(self, request, context):
         """Handle an inference request from a client."""
         log.info(
             f"[bold magenta]Inference request[/]: "
@@ -163,7 +163,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
         )
 
         try:
-            result = self.orchestrator.run_inference(
+            result = await self.orchestrator.run_inference(
                 prompt=request.prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature or 0.7,
@@ -196,7 +196,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 generated_text=f"ERROR: {e}",
             )
 
-    def SubmitInferenceStream(self, request, context):
+    async def SubmitInferenceStream(self, request, context):
         """Handle a streaming inference request from a client."""
         request_id = request.request_id or uuid.uuid4().hex[:8]
         log.info(
@@ -207,7 +207,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
         )
 
         try:
-            for event in self.orchestrator.run_inference_stream(
+            async for event in self.orchestrator.run_inference_stream(
                 prompt=request.prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature or 0.7,
@@ -216,13 +216,14 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 request_id=request_id,
                 user_id=request.user_id,
             ):
-                if not context.is_active():
-                    self.orchestrator.cancel_inference(
-                        request_id=request_id,
-                        reason="client disconnected",
-                    )
-                    break
                 yield event
+        except asyncio.CancelledError:
+            log.info(f"Client disconnected for request {request_id}")
+            await self.orchestrator.cancel_inference(
+                request_id=request_id,
+                reason="client disconnected",
+            )
+            raise
         except RequestCancelledError as e:
             yield inference_pb2.InferenceEvent(
                 request_id=request_id,
@@ -237,9 +238,9 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
                 error=str(e),
             )
 
-    def CancelInference(self, request, context):
+    async def CancelInference(self, request, context):
         """Handle explicit client cancellation of an active request."""
-        cancelled = self.orchestrator.cancel_inference(
+        cancelled = await self.orchestrator.cancel_inference(
             request_id=request.request_id,
             reason=request.reason or "cancelled by client",
         )
@@ -253,9 +254,9 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             status="cancellation requested",
         )
 
-    def SwitchModel(self, request, context):
+    async def SwitchModel(self, request, context):
         """Handle request to dynamically switch the active model."""
-        success, status_msg = self.orchestrator.switch_active_model(
+        success, status_msg = await self.orchestrator.switch_active_model(
             model_name=request.model_name
         )
         return inference_pb2.SwitchModelResponse(
@@ -263,7 +264,7 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             status=status_msg,
         )
 
-    def CacheModel(self, request, context):
+    async def CacheModel(self, request, context):
         """Handle request to pre-cache a model's weights."""
         success, cache_path, status_msg = self.orchestrator.cache_model(
             model_name=request.model_name
@@ -273,7 +274,6 @@ class CoordinatorServiceImpl(inference_pb2_grpc.CoordinatorServiceServicer):
             cache_path=cache_path,
             message=status_msg,
         )
-
 
 class Orchestrator:
     """Central coordinator for the distributed inference system.
@@ -299,17 +299,17 @@ class Orchestrator:
         self._partition_plan: Optional[PartitionPlan] = None
         self._execution_plan: Optional[ExecutionPlan] = None
         self._tokenizer = None
-        self._server: Optional[grpc.Server] = None
+        self._server: Optional[grpc.aio.Server] = None
         self._running = False
         self._model_loaded = False
-        self._health_thread: Optional[threading.Thread] = None
-        self._state_lock = threading.RLock()
-        self._request_cond = threading.Condition(self._state_lock)
+        self._health_task: Optional[asyncio.Task] = None
+        self._state_lock = asyncio.Lock()
+        self._request_cond = asyncio.Condition(self._state_lock)
         self._active_requests = 0
         self._queued_requests = 0
         self._accepting_requests = True
         self._request_contexts: dict[str, RequestContext] = {}
-        self._contexts_lock = threading.RLock()
+        self._contexts_lock = asyncio.Lock()
         self._max_concurrent_requests = max(
             1,
             int(
@@ -365,7 +365,7 @@ class Orchestrator:
             )
         self._plan_version = 0
         self._last_rebalance_reason = ""
-        self._rebalance_lock = threading.RLock()
+        self._rebalance_lock = asyncio.Lock()
         self._node_load_backoff_until: dict[str, float] = {}
         self._rebalance_controller = RebalanceController(
             callback=self._rebalance_pipeline,
@@ -384,12 +384,9 @@ class Orchestrator:
         """Current active rebalance plan version."""
         return f"v{self._plan_version}"
 
-    def start(self, block: bool = True) -> None:
-        """Start the coordinator gRPC server.
+    async def start(self) -> None:
+        """Start the coordinator gRPC server."""
 
-        Args:
-            block: If True, blocks until the server is stopped.
-        """
         port = self.config.coordinator.port
         host = self.config.coordinator.host
 
@@ -398,10 +395,7 @@ class Orchestrator:
             ("grpc.max_receive_message_length", 256 * 1024 * 1024),
         ]
 
-        self._server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=10),
-            options=options,
-        )
+        self._server = grpc.aio.server(options=options)
 
         servicer = CoordinatorServiceImpl(self)
         inference_pb2_grpc.add_CoordinatorServiceServicer_to_server(
@@ -409,55 +403,48 @@ class Orchestrator:
         )
 
         self._server.add_insecure_port(f"{host}:{port}")
-        self._server.start()
+        await self._server.start()
         self._running = True
         self._rebalance_controller.start()
+        if self._concurrent_scheduler is not None:
+            self._concurrent_scheduler.start()
 
         log.info(f"[bold blue]Coordinator started[/] on {host}:{port}")
 
-        # Start health monitoring thread
-        self._health_thread = threading.Thread(
-            target=self._health_monitor_loop,
-            daemon=True,
+        # Start health monitoring task
+        self._health_task = asyncio.create_task(
+            self._health_monitor_loop(),
             name="health-monitor",
         )
-        self._health_thread.start()
 
-        if block:
-            try:
-                self._server.wait_for_termination()
-            except KeyboardInterrupt:
-                self.stop()
-
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Stop the coordinator."""
         log.info("Stopping coordinator...")
         self._running = False
-        self._rebalance_controller.stop()
+        await self._rebalance_controller.stop()
         if self._concurrent_scheduler is not None:
-            self._concurrent_scheduler.stop()
+            await self._concurrent_scheduler.stop()
         if self._server:
-            self._server.stop(grace=5)
-        self.router.close()
+            await self._server.stop(grace=5)
+        if self._health_task:
+            self._health_task.cancel()
+        await self.router.close()
         log.info("Coordinator stopped")
 
     def _on_scheduler_metrics(self, active_requests: int, queued_requests: int) -> None:
         """Mirror scheduler counters for legacy observability and tests."""
-        with self._state_lock:
-            self._active_requests = max(0, int(active_requests))
-            self._queued_requests = max(0, int(queued_requests))
-            self._request_cond.notify_all()
+        if not self._state_lock:
+            return
+        async def update():
+            async with self._state_lock:
+                self._active_requests = max(0, int(active_requests))
+                self._queued_requests = max(0, int(queued_requests))
+                self._request_cond.notify_all()
+        # Fire and forget update
+        asyncio.create_task(update())
 
-    def wait_for_nodes(self, min_nodes: int, timeout: float = 60.0) -> bool:
-        """Wait until minimum number of nodes have registered.
-
-        Args:
-            min_nodes: Minimum number of nodes to wait for.
-            timeout: Maximum wait time in seconds.
-
-        Returns:
-            True if sufficient nodes registered within timeout.
-        """
+    async def wait_for_nodes(self, min_nodes: int, timeout: float = 60.0) -> bool:
+        """Wait until minimum number of nodes have registered."""
         log.info(f"Waiting for {min_nodes} nodes (timeout {timeout}s)...")
         start = time.time()
 
@@ -466,14 +453,14 @@ class Orchestrator:
             if active >= min_nodes:
                 log.info(f"Got {active} nodes, proceeding")
                 return True
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
         log.warning(
             f"Timeout: only {len(self.registry.get_admitted_active_nodes())}/{min_nodes} nodes registered"
         )
         return len(self.registry.get_admitted_active_nodes()) > 0
 
-    def setup_model(self) -> None:
+    async def setup_model(self) -> None:
         """Partition the model and load shards onto nodes.
 
         Must be called after nodes have registered.
@@ -482,7 +469,7 @@ class Orchestrator:
         if not nodes:
             raise RuntimeError("No admitted active nodes available for model setup")
         self._ensure_tokenizer()
-        self._rebalance_controller.run_now("initial_setup")
+        await self._rebalance_controller.run_now("initial_setup")
 
     def _ensure_tokenizer(self) -> None:
         """Load tokenizer lazily and exactly once."""
@@ -496,12 +483,15 @@ class Orchestrator:
         if event in {"register", "unregister", "dead"}:
             self._rebalance_controller.request(f"topology:{event}")
 
-    def _rebalance_pipeline(self, reason: str) -> bool:
+    async def _rebalance_pipeline(self, reason: str) -> bool:
         """Recompute and apply partitioning with drain-then-swap cutover."""
         if not self._running and reason != "initial_setup":
             return False
 
-        with self._rebalance_lock:
+        if not self._rebalance_lock:
+            return False
+
+        async with self._rebalance_lock:
             start = time.time()
             self._ensure_tokenizer()
 
@@ -511,8 +501,8 @@ class Orchestrator:
             last_error: Optional[Exception] = None
             applied = False
 
-            self._begin_drain()
-            drained = self._wait_for_drain(
+            await self._begin_drain()
+            drained = await self._wait_for_drain(
                 timeout_sec=self.config.coordinator.rebalance_drain_timeout_sec
             )
             if not drained:
@@ -524,12 +514,12 @@ class Orchestrator:
                     "Rebalance aborted: Drain timeout reached with active requests still running. "
                     "Cannot swap cluster topology safely."
                 )
-                self._end_drain()
+                await self._end_drain()
                 return False
 
             try:
                 for attempt in range(1, 4):
-                    nodes = self._get_rebalance_candidate_nodes()
+                    nodes = await self._get_rebalance_candidate_nodes()
                     if not nodes:
                         break
 
@@ -552,14 +542,14 @@ class Orchestrator:
                     new_execution = self.scheduler.create_execution_plan(new_plan)
 
                     try:
-                        self._load_partition_plan(new_plan)
-                        with self._state_lock:
+                        await self._load_partition_plan(new_plan)
+                        async with self._state_lock:
                             self._partition_plan = new_plan
                             self._execution_plan = new_execution
                             self._model_loaded = True
                             self._plan_version += 1
                             self._last_rebalance_reason = reason
-                        self._unload_removed_nodes(old_plan, new_plan)
+                        await self._unload_removed_nodes(old_plan, new_plan)
                         elapsed_ms = (time.time() - start) * 1000
                         log.info(
                             f"Rebalance complete ({self.plan_version}, reason={reason}) "
@@ -588,9 +578,9 @@ class Orchestrator:
                     old_plan
                     and old_execution
                     and old_loaded
-                    and self._is_plan_viable(old_plan)
+                    and await self._is_plan_viable(old_plan)
                 ):
-                    with self._state_lock:
+                    async with self._state_lock:
                         self._partition_plan = old_plan
                         self._execution_plan = old_execution
                         self._model_loaded = old_loaded
@@ -598,7 +588,7 @@ class Orchestrator:
                         "Rebalance failed; retained last known-good execution plan"
                     )
                 else:
-                    with self._state_lock:
+                    async with self._state_lock:
                         self._model_loaded = False
                         self._partition_plan = None
                         self._execution_plan = None
@@ -615,9 +605,9 @@ class Orchestrator:
                 log.error(message)
                 return False
             finally:
-                self._end_drain()
+                await self._end_drain()
 
-    def _get_rebalance_candidate_nodes(self):
+    async def _get_rebalance_candidate_nodes(self):
         """Return admitted nodes currently reachable for shard placement."""
         now = time.time()
         candidates = []
@@ -625,7 +615,7 @@ class Orchestrator:
             backoff_until = self._node_load_backoff_until.get(node.node_id, 0.0)
             if backoff_until > now:
                 continue
-            health = self.router.check_node_health(node.address)
+            health = await self.router.check_node_health(node.address)
             if health is None:
                 self.registry.mark_suspect(node.node_id)
                 log.warning(
@@ -663,7 +653,7 @@ class Orchestrator:
             f"{backoff_sec:.0f}s after shard-load failure"
         )
 
-    def _is_plan_viable(self, plan: PartitionPlan) -> bool:
+    async def _is_plan_viable(self, plan: PartitionPlan) -> bool:
         """Check whether a plan only references currently live/reachable nodes."""
         active_ids = {n.node_id for n in self.registry.get_admitted_active_nodes()}
         plan_ids = {assignment.node_id for assignment in plan.assignments}
@@ -673,11 +663,11 @@ class Orchestrator:
             node = self.registry.get_node(assignment.node_id)
             if not node:
                 return False
-            if self.router.check_node_health(node.address) is None:
+            if await self.router.check_node_health(node.address) is None:
                 return False
         return True
 
-    def _load_partition_plan(self, plan: PartitionPlan) -> None:
+    async def _load_partition_plan(self, plan: PartitionPlan) -> None:
         """Load a partition plan onto nodes and update registry assignments."""
         active_assignments = {
             assignment.node_id: assignment for assignment in plan.assignments
@@ -698,7 +688,7 @@ class Orchestrator:
                 continue
 
             self.registry.set_node_state(node.node_id, NodeState.LOADING)
-            if self.router.check_node_health(node.address) is None:
+            if await self.router.check_node_health(node.address) is None:
                 raise NodeLoadError(
                     node_id=node.node_id,
                     message=(
@@ -709,7 +699,7 @@ class Orchestrator:
                 cache_path = self.model_cache.ensure_cached(
                     self.config.coordinator.active_model_name
                 )
-                self.router.load_shard_on_node(
+                await self.router.load_shard_on_node(
                     address=node.address,
                     model_name=self.config.coordinator.active_model_name,
                     start_layer=assignment.start_layer,
@@ -740,7 +730,7 @@ class Orchestrator:
                 if node.state not in (NodeState.DEAD, NodeState.SUSPECT):
                     node.state = NodeState.IDLE
 
-    def _unload_removed_nodes(
+    async def _unload_removed_nodes(
         self,
         old_plan: Optional[PartitionPlan],
         new_plan: PartitionPlan,
@@ -755,43 +745,45 @@ class Orchestrator:
             node = self.registry.get_node(node_id)
             if not node:
                 continue
-            if self.router.check_node_health(node.address) is None:
+            if await self.router.check_node_health(node.address) is None:
                 continue
-            self.router.unload_shard_on_node(node.address)
+            await self.router.unload_shard_on_node(node.address)
 
-    def _begin_drain(self) -> None:
-        with self._state_lock:
+    async def _begin_drain(self) -> None:
+        async with self._state_lock:
             self._accepting_requests = False
             self._request_cond.notify_all()
         if self._concurrent_scheduler is not None:
-            self._concurrent_scheduler.set_accepting(False)
+            await self._concurrent_scheduler.set_accepting(False)
 
-    def _end_drain(self) -> None:
-        with self._state_lock:
+    async def _end_drain(self) -> None:
+        async with self._state_lock:
             self._accepting_requests = True
             self._request_cond.notify_all()
         if self._concurrent_scheduler is not None:
-            self._concurrent_scheduler.set_accepting(True)
+            await self._concurrent_scheduler.set_accepting(True)
 
-    def _wait_for_drain(self, timeout_sec: float) -> bool:
+    async def _wait_for_drain(self, timeout_sec: float) -> bool:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if self._concurrent_scheduler is not None:
-                if self._concurrent_scheduler.active_count == 0:
+                active = await self._concurrent_scheduler.get_active_count()
+                if active == 0:
                     return True
             else:
-                with self._state_lock:
+                async with self._state_lock:
                     if self._active_requests == 0:
                         return True
-            time.sleep(0.05)
+            await asyncio.sleep(0.05)
         if self._concurrent_scheduler is not None:
-            return self._concurrent_scheduler.active_count == 0
-        with self._state_lock:
+            active = await self._concurrent_scheduler.get_active_count()
+            return active == 0
+        async with self._state_lock:
             return self._active_requests == 0
 
-    def _enter_request(self, request_id: str) -> float:
+    async def _enter_request(self, request_id: str) -> float:
         wait_start = time.time()
-        with self._state_lock:
+        async with self._state_lock:
             if not self._accepting_requests:
                 raise RuntimeError("Coordinator is rebalancing; retry shortly")
 
@@ -808,7 +800,10 @@ class Orchestrator:
                             raise RuntimeError(
                                 "Coordinator is rebalancing; retry shortly"
                             )
-                        self._request_cond.wait(timeout=0.1)
+                        try:
+                            await asyncio.wait_for(self._request_cond.wait(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            pass
                 finally:
                     self._queued_requests = max(self._queued_requests - 1, 0)
 
@@ -820,24 +815,24 @@ class Orchestrator:
             )
         return wait_ms
 
-    def _exit_request(self) -> None:
-        with self._state_lock:
+    async def _exit_request(self) -> None:
+        async with self._state_lock:
             self._active_requests = max(self._active_requests - 1, 0)
             self._request_cond.notify_all()
 
-    def _acquire_request_slot(
+    async def _acquire_request_slot(
         self,
         request_context: RequestContext,
         execution_plan: ExecutionPlan,
     ) -> Optional[SchedulerTicket]:
         """Acquire request concurrency slot via legacy gate or concurrent scheduler."""
         if self._concurrent_scheduler is None:
-            request_context.queue_wait_ms = self._enter_request(request_context.request_id)
+            request_context.queue_wait_ms = await self._enter_request(request_context.request_id)
             request_context.state = "PREFILL"
             request_context.execution_plan = execution_plan # Bug 2 Fix: Store plan on context
             return None
 
-        ticket = self._concurrent_scheduler.acquire(
+        ticket = await self._concurrent_scheduler.acquire(
             request_id=request_context.request_id,
             user_id=request_context.user_id,
             execution_plan=execution_plan,
@@ -850,16 +845,16 @@ class Orchestrator:
         request_context.execution_plan = execution_plan # Bug 2 Fix: Store plan on context
         return ticket
 
-    def _release_request_slot(self, request_id: str, ticket: Optional[SchedulerTicket]) -> None:
+    async def _release_request_slot(self, request_id: str, ticket: Optional[SchedulerTicket]) -> None:
         """Release request slot acquired by _acquire_request_slot."""
         if self._concurrent_scheduler is None:
-            self._exit_request()
+            await self._exit_request()
             return
         if ticket is not None:
-            self._concurrent_scheduler.release(request_id)
+            await self._concurrent_scheduler.release(request_id)
 
-    def _register_request_context(self, request_id: str, user_id: str = "") -> RequestContext:
-        with self._contexts_lock:
+    async def _register_request_context(self, request_id: str, user_id: str = "") -> RequestContext:
+        async with self._contexts_lock:
             if request_id in self._request_contexts:
                 raise RuntimeError(
                     f"request_id '{request_id}' is already active"
@@ -868,15 +863,15 @@ class Orchestrator:
             self._request_contexts[request_id] = context
             return context
 
-    def _get_request_context(self, request_id: str) -> Optional[RequestContext]:
-        with self._contexts_lock:
+    async def _get_request_context(self, request_id: str) -> Optional[RequestContext]:
+        async with self._contexts_lock:
             return self._request_contexts.get(request_id)
 
-    def _unregister_request_context(self, request_id: str) -> None:
-        with self._contexts_lock:
+    async def _unregister_request_context(self, request_id: str) -> None:
+        async with self._contexts_lock:
             self._request_contexts.pop(request_id, None)
 
-    def _assert_not_cancelled(
+    async def _assert_not_cancelled(
         self,
         request_context: RequestContext,
         execution_plan: Optional[ExecutionPlan] = None,
@@ -885,7 +880,7 @@ class Orchestrator:
             return
         if execution_plan:
             try:
-                self.router.cancel_request_on_pipeline(
+                await self.router.cancel_request_on_pipeline(
                     execution_plan=execution_plan,
                     request_id=request_context.request_id,
                 )
@@ -915,9 +910,9 @@ class Orchestrator:
             log.error(f"Failed to cache model '{model_name}': {e}")
             return False, "", str(e)
 
-    def switch_active_model(self, model_name: str) -> tuple[bool, str]:
+    async def switch_active_model(self, model_name: str) -> tuple[bool, str]:
         """Dynamically switch the active model running on the cluster."""
-        with self._state_lock:
+        async with self._state_lock:
             if not self._running:
                 return False, "Orchestrator is not running"
             
@@ -931,9 +926,9 @@ class Orchestrator:
             
             return True, f"Model switch to {model_name} requested. Cluster is rebalancing."
 
-    def cancel_inference(self, request_id: str, reason: str = "cancelled") -> bool:
+    async def cancel_inference(self, request_id: str, reason: str = "cancelled") -> bool:
         """Request cancellation for an active inference context."""
-        context = self._get_request_context(request_id)
+        context = await self._get_request_context(request_id)
         if context is None:
             return False
         context.cancel_reason = reason
@@ -945,12 +940,12 @@ class Orchestrator:
         # so it sends 'ClearCache' to the actual nodes holding its memory (even if topology changed).
         execution_plan = context.execution_plan
         if not execution_plan:
-            with self._state_lock:
+            async with self._state_lock:
                 execution_plan = self._execution_plan
                 
         if execution_plan:
             try:
-                self.router.cancel_request_on_pipeline(
+                await self.router.cancel_request_on_pipeline(
                     execution_plan=execution_plan,
                     request_id=request_id,
                 )
@@ -967,7 +962,7 @@ class Orchestrator:
             "scheduler_policy": self._scheduler_policy,
         }
 
-    def _await_model_ready(self, request_context: RequestContext) -> None:
+    async def _await_model_ready(self, request_context: RequestContext) -> None:
         """Wait briefly for model readiness so warmup races don't fail requests."""
         # Bug 4 Fix: Coarse Grained Locking Bottlenecks
         # `is_ready` accesses boolean properties. In Python, reference updates (GIL) 
@@ -993,10 +988,10 @@ class Orchestrator:
             f"(timeout={timeout_sec:.1f}s)"
         )
         while time.time() < deadline:
-            self._assert_not_cancelled(request_context)
+            await self._assert_not_cancelled(request_context)
             if self.is_ready:
                 return
-            time.sleep(poll_sec)
+            await asyncio.sleep(poll_sec)
 
         if self.is_ready:
             return
@@ -1006,7 +1001,7 @@ class Orchestrator:
             f"still warming up after {timeout_sec:.1f}s"
         )
 
-    def run_inference(
+    async def run_inference(
         self,
         prompt: str,
         max_tokens: int = 50,
@@ -1020,7 +1015,7 @@ class Orchestrator:
         completed = None
         stream_request_id = request_id or uuid.uuid4().hex[:8]
 
-        for event in self.run_inference_stream(
+        async for event in self.run_inference_stream(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1040,7 +1035,7 @@ class Orchestrator:
             raise RuntimeError("Inference stream ended without a completion event")
         return completed
 
-    def run_inference_stream(
+    async def run_inference_stream(
         self,
         prompt: str,
         max_tokens: int = 50,
@@ -1049,10 +1044,10 @@ class Orchestrator:
         top_k: int = 50,
         request_id: str = "",
         user_id: str = "",
-    ) -> Iterator[inference_pb2.InferenceEvent]:
+    ) -> AsyncIterator[inference_pb2.InferenceEvent]:
         """Run inference and yield streaming hop/token/completion events."""
         request_id = request_id or uuid.uuid4().hex[:8]
-        request_context = self._register_request_context(request_id, user_id=user_id)
+        request_context = await self._register_request_context(request_id, user_id=user_id)
         entered = False
         scheduler_ticket: Optional[SchedulerTicket] = None
         execution_plan: Optional[ExecutionPlan] = None
@@ -1060,13 +1055,13 @@ class Orchestrator:
         completed_successfully = False
 
         try:
-            self._await_model_ready(request_context)
-            with self._state_lock:
+            await self._await_model_ready(request_context)
+            async with self._state_lock:
                 execution_plan = self._execution_plan
             if not execution_plan:
                 raise RuntimeError("No execution plan available")
 
-            scheduler_ticket = self._acquire_request_slot(request_context, execution_plan)
+            scheduler_ticket = await self._acquire_request_slot(request_context, execution_plan)
             entered = True
 
             start_time = time.time()
@@ -1086,12 +1081,12 @@ class Orchestrator:
             total_time_ms = 0.0
             tokens_per_sec = 0.0
 
-            self._assert_not_cancelled(request_context, execution_plan)
+            await self._assert_not_cancelled(request_context, execution_plan)
 
             if use_kv_cache:
                 logits = None
                 prefill_cache_pos = int(input_ids.shape[1] - 1)
-                for trace in self.router.route_forward_stream(
+                async for trace in self.router.route_forward_stream(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     execution_plan=execution_plan,
@@ -1101,7 +1096,7 @@ class Orchestrator:
                     cache_position=prefill_cache_pos,
                     is_prefill=True,
                 ):
-                    self._assert_not_cancelled(request_context, execution_plan)
+                    await self._assert_not_cancelled(request_context, execution_plan)
                     logits = trace.output
                     all_hop_latencies.append(trace.hop_latency_ms)
                     yield inference_pb2.InferenceEvent(
@@ -1139,7 +1134,7 @@ class Orchestrator:
                 )
 
                 for step in range(max_tokens):
-                    self._assert_not_cancelled(request_context, execution_plan)
+                    await self._assert_not_cancelled(request_context, execution_plan)
                     request_context.state = "DECODING"
                     current_idx = initial_len + step
                     
@@ -1149,7 +1144,7 @@ class Orchestrator:
                         dynamic_attn_mask = attention_mask_buffer[:, :current_idx] if attention_mask_buffer is not None else None
                         logits = None
                         
-                        for trace in self.router.route_forward_stream(
+                        async for trace in self.router.route_forward_stream(
                             input_ids=decode_input,
                             attention_mask=dynamic_attn_mask,
                             execution_plan=execution_plan,
@@ -1159,7 +1154,7 @@ class Orchestrator:
                             cache_position=decode_cache_pos,
                             is_prefill=False,
                         ):
-                            self._assert_not_cancelled(
+                            await self._assert_not_cancelled(
                                 request_context, execution_plan
                             )
                             logits = trace.output
@@ -1235,7 +1230,7 @@ class Orchestrator:
                 )
 
                 for step in range(max_tokens):
-                    self._assert_not_cancelled(request_context, execution_plan)
+                    await self._assert_not_cancelled(request_context, execution_plan)
                     request_context.state = "DECODING"
                     current_idx = initial_len + step
                     
@@ -1243,7 +1238,7 @@ class Orchestrator:
                     dynamic_attn_mask = attention_mask_buffer[:, :current_idx] if attention_mask_buffer is not None else None
                     
                     logits = None
-                    for trace in self.router.route_forward_stream(
+                    async for trace in self.router.route_forward_stream(
                         input_ids=dynamic_input_ids,
                         attention_mask=dynamic_attn_mask,
                         execution_plan=execution_plan,
@@ -1253,7 +1248,7 @@ class Orchestrator:
                         cache_position=None,
                         is_prefill=False,
                     ):
-                        self._assert_not_cancelled(request_context, execution_plan)
+                        await self._assert_not_cancelled(request_context, execution_plan)
                         logits = trace.output
                         all_hop_latencies.append(trace.hop_latency_ms)
                         yield inference_pb2.InferenceEvent(
@@ -1341,15 +1336,15 @@ class Orchestrator:
                 request_context.state = "FAILED"
             if use_kv_cache and execution_plan:
                 try:
-                    self.router.clear_request_cache_on_pipeline(
+                    await self.router.clear_request_cache_on_pipeline(
                         execution_plan=execution_plan,
                         request_id=request_id,
                     )
                 except Exception as e:
                     log.warning(f"Cache cleanup failed for {request_id}: {e}")
             if entered:
-                self._release_request_slot(request_id=request_id, ticket=scheduler_ticket)
-            self._unregister_request_context(request_id)
+                await self._release_request_slot(request_id=request_id, ticket=scheduler_ticket)
+            await self._unregister_request_context(request_id)
 
     @staticmethod
     def _sample_next_token(
@@ -1394,14 +1389,14 @@ class Orchestrator:
 
         return torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-    def _health_monitor_loop(self) -> None:
+    async def _health_monitor_loop(self) -> None:
         """Background health monitoring of registered nodes."""
         interval = self.config.coordinator.heartbeat_interval_sec
         timeout = self.config.coordinator.heartbeat_timeout_sec
         threshold = self.config.coordinator.failure_threshold
 
         while self._running:
-            time.sleep(interval)
+            await asyncio.sleep(interval)
 
             for node in self.registry.get_all_nodes():
                 if node.state == NodeState.DEAD:

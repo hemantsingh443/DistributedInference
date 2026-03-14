@@ -94,7 +94,7 @@ def _stop_processes(processes: list[subprocess.Popen]) -> None:
             proc.kill()
 
 
-def _run_phase(
+async def _run_phase(
     *,
     enable_kv_cache: bool,
     num_runs: int,
@@ -120,8 +120,8 @@ def _run_phase(
         config.inference.enable_kv_cache = enable_kv_cache
 
         orchestrator = Orchestrator(config=config)
-        orchestrator.start(block=False)
-        time.sleep(1.0)
+        await orchestrator.start()
+        await asyncio.sleep(1.0)
 
         node_procs = _start_nodes(
             num_nodes=num_nodes,
@@ -131,14 +131,14 @@ def _run_phase(
             log_level=log_level,
         )
 
-        if not orchestrator.wait_for_nodes(num_nodes, timeout=startup_timeout):
+        if not await orchestrator.wait_for_nodes(num_nodes, timeout=startup_timeout):
             raise RuntimeError("Not enough nodes registered")
 
-        orchestrator.setup_model()
+        await orchestrator.setup_model()
 
         for run_idx in range(1, num_runs + 1):
             req_id = f"{phase_name.lower()}-{uuid.uuid4().hex[:8]}"
-            result = orchestrator.run_inference(
+            result = await orchestrator.run_inference(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=0.7,
@@ -164,13 +164,15 @@ def _run_phase(
     finally:
         if orchestrator is not None:
             try:
-                orchestrator.stop()
+                await orchestrator.stop()
             except Exception:
                 pass
         _stop_processes(node_procs)
 
     return metrics
 
+
+import asyncio
 
 def _summarize(name: str, runs: list[RunMetrics]) -> dict:
     latencies = [r.latency_ms for r in runs]
@@ -187,7 +189,7 @@ def _summarize(name: str, runs: list[RunMetrics]) -> dict:
     }
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Benchmark distributed KV cache")
     parser.add_argument("--num-runs", type=int, default=4)
     parser.add_argument("--num-nodes", type=int, default=3)
@@ -215,7 +217,7 @@ def main():
 
     setup_logging(level=args.log_level, component="kv-bench")
 
-    on_runs = _run_phase(
+    on_runs = await _run_phase(
         enable_kv_cache=True,
         num_runs=args.num_runs,
         num_nodes=args.num_nodes,
@@ -226,7 +228,7 @@ def main():
         startup_timeout=args.startup_timeout,
         log_level=args.log_level,
     )
-    off_runs = _run_phase(
+    off_runs = await _run_phase(
         enable_kv_cache=False,
         num_runs=args.num_runs,
         num_nodes=args.num_nodes,
@@ -272,4 +274,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

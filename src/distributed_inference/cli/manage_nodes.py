@@ -98,19 +98,13 @@ def _cache(args: argparse.Namespace) -> None:
     print(f"Requesting coordinator to cache model '{args.name}'...")
     print("This may take several minutes depending on model size and network speed.")
     try:
-        response = requests.post(url, json=payload, timeout=610)  # > 10m gateway timeout
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to connect to web gateway: {e}")
-        return
-
-    if response.status_code == 200:
-        data = response.json()
+        data = _request_json("POST", args.web_url, "/api/model/cache", payload)
         if data.get("success"):
             print(f"Success! Model cached at: {data.get('cache_path')}")
         else:
             print(f"Cache request failed: {data.get('status')}")
-    else:
-        print(f"Error caching model: {response.text}")
+    except Exception as e:
+        print(f"Error caching model: {e}")
 
 
 def main() -> None:

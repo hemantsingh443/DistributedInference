@@ -1,5 +1,6 @@
 """Tests for node server cache control RPC wiring."""
 
+import pytest
 import torch
 
 from distributed_inference.common.serialization import serialize_tensor
@@ -7,7 +8,8 @@ from distributed_inference.node.server import NodeServiceImpl
 from distributed_inference.proto import inference_pb2
 
 
-def test_run_forward_passes_cache_flags_to_executor():
+@pytest.mark.asyncio
+async def test_run_forward_passes_cache_flags_to_executor():
     servicer = NodeServiceImpl(node_id="node-1", device_type="cpu")
     captured = {}
 
@@ -31,7 +33,7 @@ def test_run_forward_passes_cache_flags_to_executor():
         is_prefill=False,
     )
 
-    _ = servicer.RunForward(req, context=None)
+    _ = await servicer.RunForward(req, context=None)
     assert captured["request_id"] == "req-1"
     assert captured["use_cache"] is True
     assert captured["reset_cache"] is True
@@ -39,18 +41,19 @@ def test_run_forward_passes_cache_flags_to_executor():
     assert captured["is_prefill"] is False
 
 
-def test_clear_request_cache_rpc_dispatch():
+@pytest.mark.asyncio
+async def test_clear_request_cache_rpc_dispatch():
     servicer = NodeServiceImpl(node_id="node-2", device_type="cpu")
     calls = {"clear_one": [], "clear_all": 0}
 
     servicer.executor.clear_request_cache = lambda request_id: calls["clear_one"].append(request_id)
     servicer.executor.clear_all_cache = lambda: calls.__setitem__("clear_all", calls["clear_all"] + 1)
 
-    _ = servicer.ClearRequestCache(
+    _ = await servicer.ClearRequestCache(
         inference_pb2.CacheControl(request_id="abc", clear_all=False),
         context=None,
     )
-    _ = servicer.ClearRequestCache(
+    _ = await servicer.ClearRequestCache(
         inference_pb2.CacheControl(clear_all=True),
         context=None,
     )
@@ -59,7 +62,8 @@ def test_clear_request_cache_rpc_dispatch():
     assert calls["clear_all"] == 1
 
 
-def test_cancel_request_rpc_marks_request_and_blocks_forward():
+@pytest.mark.asyncio
+async def test_cancel_request_rpc_marks_request_and_blocks_forward():
     class DummyContext:
         def __init__(self):
             self.code = None
@@ -90,13 +94,13 @@ def test_cancel_request_rpc_marks_request_and_blocks_forward():
         request_id="cancel-me",
     )
 
-    _ = servicer.CancelRequest(
+    _ = await servicer.CancelRequest(
         inference_pb2.CacheControl(request_id="cancel-me", clear_all=False),
         context=None,
     )
 
     ctx = DummyContext()
-    response = servicer.RunForward(req, context=ctx)
+    response = await servicer.RunForward(req, context=ctx)
     assert response.hidden_states.data == b""
     assert calls["forward"] == 0
     assert "cancelled" in ctx.details

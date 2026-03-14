@@ -25,7 +25,7 @@ class DistributedInferencePipeline:
         self.orchestrator = Orchestrator(config=self.config)
         self._started = False
 
-    def setup(self, min_nodes: int = 1, wait_timeout: float = 60.0) -> bool:
+    async def setup(self, min_nodes: int = 1, wait_timeout: float = 60.0) -> bool:
         """Set up the distributed inference system.
 
         Starts the coordinator, waits for nodes, partitions the model,
@@ -40,22 +40,22 @@ class DistributedInferencePipeline:
         """
         log.info("[bold]Setting up distributed inference pipeline[/]")
 
-        # Start coordinator (non-blocking)
-        self.orchestrator.start(block=False)
+        # Start coordinator
+        await self.orchestrator.start()
         self._started = True
 
         # Wait for nodes
-        if not self.orchestrator.wait_for_nodes(min_nodes, timeout=wait_timeout):
+        if not await self.orchestrator.wait_for_nodes(min_nodes, timeout=wait_timeout):
             log.error("Not enough nodes registered")
             return False
 
         # Partition and load model
-        self.orchestrator.setup_model()
+        await self.orchestrator.setup_model()
 
         log.info("[bold green]Pipeline ready for inference![/]")
         return True
 
-    def generate(
+    async def generate(
         self,
         prompt: str,
         max_tokens: Optional[int] = None,
@@ -79,7 +79,7 @@ class DistributedInferencePipeline:
         if not self.orchestrator.is_ready:
             raise RuntimeError("Pipeline not set up. Call setup() first.")
 
-        result = self.orchestrator.run_inference(
+        result = await self.orchestrator.run_inference(
             prompt=prompt,
             max_tokens=max_tokens or self.config.inference.max_tokens,
             temperature=temperature if temperature is not None else self.config.inference.temperature,
@@ -95,9 +95,9 @@ class DistributedInferencePipeline:
             "per_hop_latency_ms": list(result.per_hop_latency_ms),
         }
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Shut down the pipeline and coordinator."""
         if self._started:
-            self.orchestrator.stop()
+            await self.orchestrator.stop()
             self._started = False
             log.info("Pipeline shut down")
